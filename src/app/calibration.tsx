@@ -6,6 +6,7 @@ import {
   CALIBRATION_SEQUENCE,
   CalibrationTarget,
 } from '../components/CalibrationTarget';
+import { computeRobustCalibration } from '../core/biometrics/calibrationMath';
 import { DEFAULT_BASELINE_EAR } from '../core/biometrics/earEngine';
 import { DEFAULT_GAZE_BOUNDS } from '../core/biometrics/saccadeEngine';
 import { BiometricFrameSample } from '../core/cognitive/slidingWindow';
@@ -29,7 +30,8 @@ export default function CalibrationScreen() {
 
   const handleSample = useCallback(
     (sample: BiometricFrameSample) => {
-      if (!isRunning || !sample.faceDetected) return;
+      // Descarta frames con ojos cerrados para evitar outliers en el rango del iris
+      if (!isRunning || !sample.faceDetected || sample.isEyeClosed) return;
       if (sample.avgEar > 0.08) {
         earSamplesRef.current.push(sample.avgEar);
       }
@@ -55,28 +57,20 @@ export default function CalibrationScreen() {
     const xs = gazeXSamplesRef.current;
     const ys = gazeYSamplesRef.current;
 
-    const baselineEar =
-      ears.length > 0
-        ? ears.reduce((a, b) => a + b, 0) / ears.length
-        : DEFAULT_BASELINE_EAR;
-
-    const minGazeX = xs.length > 0 ? Math.min(...xs) : DEFAULT_GAZE_BOUNDS.minGazeX;
-    const maxGazeX = xs.length > 0 ? Math.max(...xs) : DEFAULT_GAZE_BOUNDS.maxGazeX;
-    const minGazeY = ys.length > 0 ? Math.min(...ys) : DEFAULT_GAZE_BOUNDS.minGazeY;
-    const maxGazeY = ys.length > 0 ? Math.max(...ys) : DEFAULT_GAZE_BOUNDS.maxGazeY;
+    const { baselineEar, bounds } = computeRobustCalibration(ears, xs, ys);
 
     await saveCalibration({
       baselineEar,
-      minGazeX,
-      maxGazeX,
-      minGazeY,
-      maxGazeY,
+      minGazeX: bounds.minGazeX,
+      maxGazeX: bounds.maxGazeX,
+      minGazeY: bounds.minGazeY,
+      maxGazeY: bounds.maxGazeY,
     });
 
     Alert.alert(
       'Calibración guardada',
       ears.length > 0
-        ? `EAR basal: ${baselineEar.toFixed(3)} (${ears.length} muestras)`
+        ? `EAR basal: ${baselineEar.toFixed(3)} · Rango X [${bounds.minGazeX.toFixed(2)}, ${bounds.maxGazeX.toFixed(2)}] (${ears.length} muestras)`
         : 'Sin modelo TFLite activo: se guardaron umbrales base por defecto.',
       [{ text: 'Continuar', onPress: () => router.back() }]
     );

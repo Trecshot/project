@@ -4,15 +4,15 @@ Aplicación móvil de lectura instrumentada en **React Native + Expo + TypeScrip
 
 ## Estructura del Proyecto
 
-- `assets/models/` — Modelo facial MediaPipe (`face_landmarker.task` / `face_landmarks_detector.tflite`).
-- `assets/sounds/soft_chime.wav` — Alerta auditiva suave para pausas 20-20-20.
+- `assets/models/` — Modelos MediaPipe opcionales para empaquetado estático (`face_landmarks_detector.tflite` y `face_detector.tflite`).
+- `assets/sounds/soft_chime.wav` — Alerta auditiva suave (PCM 16 bits) para pausas 20-20-20.
 - `src/app/` — Rutas de Expo Router (`index`, `calibration`, `reader`, `session/[id]`).
-- `src/core/vision/` — Índices de 478 landmarks + iris y procesador de frames en worklet.
-- `src/core/biometrics/` — Motores puros de EAR, sacadas horizontales y pose de cabeza.
-- `src/core/cognitive/` — Ventana deslizante circular de 30s y máquina de estados con cooldown.
+- `src/core/vision/` — Índices de 27 landmarks clave, decodificador BlazeFace SSD (896 anclas), carga segura con fallback GPU/CPU y procesador en worklet sin GC.
+- `src/core/biometrics/` — Motores puros de EAR, sacadas con normalización anatómica del iris, pose de cabeza y calibración robusta P5/P95.
+- `src/core/cognitive/` — Ventana deslizante circular de 30s con tolerancia a parpadeos y máquina de estados con cooldown de 10 minutos.
 - `src/database/` — Esquema SQLite (`reading_sessions`, `telemetry_snapshots`, `user_calibration`) y repositorio.
 - `src/services/` — Servicio de alertas hápticas y notificaciones locales.
-- `src/components/` — `CalibrationTarget`, `CognitiveHUD` y `TelemetryChart`.
+- `src/components/` — `CalibrationTarget`, `CognitiveHUD`, `DocumentViewer` y `TelemetryChart`.
 
 ## Requisitos Previos e Instalación
 
@@ -22,17 +22,21 @@ Aplicación móvil de lectura instrumentada en **React Native + Expo + TypeScrip
    ```bash
    npm install
    ```
-2. Descarga el modelo MediaPipe Face Landmarker en `assets/models/` (ver `assets/models/README.md`).
-3. Genera los proyectos nativos Android/iOS:
+2. Genera los proyectos nativos Android/iOS y compila en tu teléfono físico por USB:
    ```bash
    npx expo prebuild
-   ```
-4. Compila y ejecuta en un dispositivo físico conectado por USB:
-   ```bash
    npx expo run:android
    ```
-5. Ejecuta pruebas unitarias y chequeo de tipos:
+3. **Carga de modelos TFLite (2 opciones):**
+   - **Vía rápida (sin recompilar):** abre la app ya compilada y usa los botones **Importar Landmarks .tflite** y **Importar BlazeFace .tflite** en el Dashboard (se copian automáticamente a `FileSystem.documentDirectory/models/`).
+   - **Vía embebida en el bundle:** extrae `face_landmarks_detector.tflite` (y opcionalmente `face_detector.tflite`) desde `face_landmarker.task` dentro de `assets/models/` y habilita sus `require(...)` en `src/core/vision/modelAssets.ts` antes de recompilar.
+4. Ejecuta pruebas unitarias y chequeo de tipos:
    ```bash
    npm run typecheck
    npm test
    ```
+
+## Notas del Lector (PDF / EPUB / TXT)
+
+- **TXT / Markdown:** funciona **100% offline** sin límites estrictos.
+- **PDF / EPUB locales:** admiten archivos de hasta **15 MB** (transferidos al `WebView` en fragmentos de 256 KB para evitar errores de memoria en Android) y requieren conexión inicial a internet para cargar `PDF.js` / `epub.js` desde CDN.

@@ -1,3 +1,4 @@
+import { computeRobustCalibration } from '../biometrics/calibrationMath';
 import {
   BlinkTrackerState,
   DEFAULT_BASELINE_EAR,
@@ -246,5 +247,22 @@ describe('Motores Biométricos, Visión SSD y Cognición', () => {
     const withinCooldown = sm.evaluate(distrMetrics, 300_000);
     expect(withinCooldown.alertToTrigger).toBeNull();
     expect(evaluateHeadPose(createNeutralLandmarks()).isAligned).toBe(true);
+  });
+
+  it('calcula calibración robusta P5/P95 descartando outliers extremos', () => {
+    const ears = [0.09, 0.28, 0.29, 0.29, 0.3, 0.28, 0.29, 0.28, 0.29, 0.48];
+    const xs = [
+      0.01, // outlier extremo inferior
+      0.28, 0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6, 0.65, 0.7, 0.72,
+      0.99, // outlier extremo superior
+    ];
+    const ys = [0.02, 0.32, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6, 0.65, 0.68, 0.98];
+
+    const cal = computeRobustCalibration(ears, xs, ys);
+    expect(cal.baselineEar).toBeCloseTo(0.289, 2);
+    expect(cal.bounds.minGazeX).toBeGreaterThan(0.1);
+    expect(cal.bounds.maxGazeX).toBeLessThan(0.85);
+    expect(cal.bounds.minGazeY).toBeGreaterThan(0.1);
+    expect(cal.bounds.maxGazeY).toBeLessThan(0.85);
   });
 });

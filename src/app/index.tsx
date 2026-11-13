@@ -11,6 +11,7 @@ import {
 import * as DocumentPicker from 'expo-document-picker';
 import { router, useFocusEffect } from 'expo-router';
 import { formatDuration } from '../components/CognitiveHUD';
+import { MAX_DOCUMENT_BYTES } from '../components/DocumentViewer';
 import { useVisionTelemetrySetup } from '../core/vision/useFaceLandmarkModel';
 import {
   GlobalTelemetryStats,
@@ -99,6 +100,14 @@ export default function DashboardScreen() {
       }
 
       const asset = result.assets[0];
+      if (asset.size && asset.size > MAX_DOCUMENT_BYTES) {
+        Alert.alert(
+          'Archivo demasiado grande',
+          'Para evitar cierres por memoria en Android WebView, selecciona archivos PDF/EPUB de hasta 15 MB.'
+        );
+        return;
+      }
+
       const lowerName = (asset.name ?? '').toLowerCase();
       const mode = lowerName.endsWith('.pdf')
         ? 'pdf'

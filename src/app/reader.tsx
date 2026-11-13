@@ -11,7 +11,10 @@ import * as FileSystem from 'expo-file-system';
 import { router, useLocalSearchParams } from 'expo-router';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { CognitiveHUD } from '../components/CognitiveHUD';
-import { DocumentViewer } from '../components/DocumentViewer';
+import {
+  DocumentViewer,
+  MAX_DOCUMENT_BYTES,
+} from '../components/DocumentViewer';
 import { DEFAULT_BASELINE_EAR } from '../core/biometrics/earEngine';
 import {
   DEFAULT_GAZE_BOUNDS,
@@ -70,6 +73,7 @@ export default function ReaderScreen() {
     useState<GazeCalibrationBounds>(DEFAULT_GAZE_BOUNDS);
   const [textContent, setTextContent] = useState(SAMPLE_STUDY_TEXT);
   const [base64Content, setBase64Content] = useState<string | null>(null);
+  const [fileTooLargeError, setFileTooLargeError] = useState<string | null>(null);
   const [fontSize, setFontSize] = useState(17);
 
   const [cognitiveState, setCognitiveState] =
@@ -154,10 +158,23 @@ export default function ReaderScreen() {
             const content = await FileSystem.readAsStringAsync(docUri);
             if (active && content) setTextContent(content);
           } else if (mode === 'pdf' || mode === 'epub') {
-            const b64 = await FileSystem.readAsStringAsync(docUri, {
-              encoding: FileSystem.EncodingType.Base64,
-            });
-            if (active && b64) setBase64Content(b64);
+            const info = await FileSystem.getInfoAsync(docUri);
+            if (
+              info.exists &&
+              typeof info.size === 'number' &&
+              info.size > MAX_DOCUMENT_BYTES
+            ) {
+              if (active) {
+                setFileTooLargeError(
+                  `El archivo supera el límite seguro de 15 MB (${(info.size / (1024 * 1024)).toFixed(1)} MB).`
+                );
+              }
+            } else {
+              const b64 = await FileSystem.readAsStringAsync(docUri, {
+                encoding: FileSystem.EncodingType.Base64,
+              });
+              if (active && b64) setBase64Content(b64);
+            }
           }
         } catch {
           // Mantiene contenido de respaldo si falla la lectura local
@@ -355,6 +372,7 @@ export default function ReaderScreen() {
         uri={docUri}
         textContent={textContent}
         base64Content={base64Content}
+        fileTooLargeError={fileTooLargeError}
         fontSize={fontSize}
       />
 
