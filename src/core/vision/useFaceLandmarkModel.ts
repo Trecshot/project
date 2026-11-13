@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Platform } from 'react-native';
 import { Asset } from 'expo-asset';
 import * as DocumentPicker from 'expo-document-picker';
@@ -165,19 +165,31 @@ export function useVisionTelemetrySetup(): VisionPipelineStatus {
     [loadModels]
   );
 
-  return {
-    model,
-    faceDetectorModel,
-    modelReady: Boolean(model),
-    detectorReady: Boolean(faceDetectorModel),
-    modelPathHint: `assets/models/${LANDMARK_MODEL_FILENAME}`,
-    activeDelegate,
-    device,
-    format,
-    hasPermission,
-    requestPermission,
-    importLocalModel,
-  };
+  return useMemo(
+    () => ({
+      model,
+      faceDetectorModel,
+      modelReady: Boolean(model),
+      detectorReady: Boolean(faceDetectorModel),
+      modelPathHint: `assets/models/${LANDMARK_MODEL_FILENAME}`,
+      activeDelegate,
+      device,
+      format,
+      hasPermission,
+      requestPermission,
+      importLocalModel,
+    }),
+    [
+      model,
+      faceDetectorModel,
+      activeDelegate,
+      device,
+      format,
+      hasPermission,
+      requestPermission,
+      importLocalModel,
+    ]
+  );
 }
 
 export { Camera };

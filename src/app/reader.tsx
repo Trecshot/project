@@ -126,13 +126,17 @@ export default function ReaderScreen() {
     [stateMachine]
   );
 
+  // Solicita permiso de cámara frontal si aún no se otorgó
+  useEffect(() => {
+    if (!vision.hasPermission) {
+      vision.requestPermission().catch(() => {});
+    }
+  }, [vision.hasPermission, vision.requestPermission]);
+
   // Carga calibración, contenido del documento (incl. base64 PDF/EPUB) y crea sesión
   useEffect(() => {
     let active = true;
     (async () => {
-      if (!vision.hasPermission) {
-        await vision.requestPermission();
-      }
       const cal = await getLatestCalibration();
       if (active && cal) {
         setBaselineEar(cal.baseline_ear);
@@ -168,10 +172,15 @@ export default function ReaderScreen() {
 
     return () => {
       active = false;
-      // Cierre seguro ante gestos Back nativos o desmontaje abrupto
+    };
+  }, [docTitle, docUri, mode]);
+
+  // Cierre idempotente y seguro de la sesión únicamente al desmontar ReaderScreen
+  useEffect(() => {
+    return () => {
       persistSessionSummary(true).catch(() => {});
     };
-  }, [docTitle, docUri, mode, vision, persistSessionSummary]);
+  }, [persistSessionSummary]);
 
   // Guarda progreso cuando la app pasa a segundo plano o se apaga la pantalla
   useEffect(() => {
