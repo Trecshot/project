@@ -11,6 +11,7 @@ import {
 import * as DocumentPicker from 'expo-document-picker';
 import { router, useFocusEffect } from 'expo-router';
 import { formatDuration } from '../components/CognitiveHUD';
+import { useVisionTelemetrySetup } from '../core/vision/useFaceLandmarkModel';
 import {
   GlobalTelemetryStats,
   ReadingSessionRow,
@@ -20,15 +21,18 @@ import {
   getGlobalStats,
   getLatestCalibration,
   listReadingSessions,
+  reconcileOrphanedSessions,
 } from '../database/telemetryRepository';
 
 export default function DashboardScreen() {
+  const vision = useVisionTelemetrySetup();
   const [calibration, setCalibration] = useState<UserCalibrationRow | null>(null);
   const [stats, setStats] = useState<GlobalTelemetryStats | null>(null);
   const [sessions, setSessions] = useState<ReadingSessionRow[]>([]);
   const [webUrl, setWebUrl] = useState('');
 
   const loadDashboard = useCallback(async () => {
+    await reconcileOrphanedSessions();
     const [cal, globalStats, recentSessions] = await Promise.all([
       getLatestCalibration(),
       getGlobalStats(),
@@ -151,6 +155,26 @@ export default function DashboardScreen() {
                 {calibration ? 'Recalibrar mirada (5s)' : 'Iniciar calibración (5s)'}
               </Text>
             </Pressable>
+            {!vision.modelReady && (
+              <View style={styles.buttonRow}>
+                <Pressable
+                  style={styles.secondaryBtnFlex}
+                  onPress={() => vision.importLocalModel('landmarks')}
+                >
+                  <Text style={styles.secondaryBtnText}>
+                    Importar Landmarks .tflite
+                  </Text>
+                </Pressable>
+                <Pressable
+                  style={styles.secondaryBtnFlex}
+                  onPress={() => vision.importLocalModel('detector')}
+                >
+                  <Text style={styles.secondaryBtnText}>
+                    Importar BlazeFace .tflite
+                  </Text>
+                </Pressable>
+              </View>
+            )}
           </View>
 
           {/* Lanzador del Lector Instrumentado */}

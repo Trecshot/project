@@ -1,8 +1,8 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
+  AppState,
   Modal,
   Pressable,
-  ScrollView,
   StyleSheet,
   Text,
   View,
@@ -10,8 +10,8 @@ import {
 import * as FileSystem from 'expo-file-system';
 import { router, useLocalSearchParams } from 'expo-router';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import { WebView } from 'react-native-webview';
 import { CognitiveHUD } from '../components/CognitiveHUD';
+import { DocumentViewer } from '../components/DocumentViewer';
 import { DEFAULT_BASELINE_EAR } from '../core/biometrics/earEngine';
 import {
   DEFAULT_GAZE_BOUNDS,
@@ -38,8 +38,6 @@ import {
   insertTelemetrySnapshot,
 } from '../database/telemetryRepository';
 import { dispatchCognitiveAlert } from '../services/alertService';
-
-const SNAPSHOT_INTERVAL_MS = 15_000;
 
 const SAMPLE_STUDY_TEXT = `Neurobiología de la Atención y Fatiga Visual
 
@@ -71,6 +69,7 @@ export default function ReaderScreen() {
   const [gazeBounds, setGazeBounds] =
     useState<GazeCalibrationBounds>(DEFAULT_GAZE_BOUNDS);
   const [textContent, setTextContent] = useState(SAMPLE_STUDY_TEXT);
+  const [base64Content, setBase64Content] = useState<string | null>(null);
   const [fontSize, setFontSize] = useState(17);
 
   const [cognitiveState, setCognitiveState] =
@@ -85,11 +84,10 @@ export default function ReaderScreen() {
 
   const sessionIdRef = useRef<number | null>(null);
   const sessionStartRef = useRef<number>(Date.now());
-  const effectiveSecRef = useRef(0);
-  const distractedSecRef = useRef(0);
-  const fatigueEventsRef = useRef(0);
+  const hasFinalizedRef = useRef(false);
   const blinkRateSamplesRef = useRef<number[]>([]);
   const isPausedRef = useRef(false);
+  const evalTickCountRef = useRef(0);
 
   const slidingWindow = useMemo(() => new BiometricSlidingWindow(), []);
   const stateMachine = useMemo(() => new CognitiveStateMachine(), []);
@@ -98,7 +96,37 @@ export default function ReaderScreen() {
     isPausedRef.current = isPaused;
   }, [isPaused]);
 
-  // Carga calibración, contenido del documento y crea la sesión SQLite
+  const persistSessionSummary = useCallback(
+    async (isFinalClose: boolean) => {
+      const sid = sessionIdRef.current;
+      if (!sid) return;
+      if (isFinalClose && hasFinalizedRef.current) return;
+      if (isFinalClose) {
+        hasFinalizedRef.current = true;
+      }
+
+      const nowMs = Date.now();
+      stateMachine.advanceClock(nowMs, isPausedRef.current);
+
+      const samples = blinkRateSamplesRef.current;
+      const meanBlink =
+        samples.length > 0
+          ? samples.reduce((a, b) => a + b, 0) / samples.length
+          : 0;
+
+      await finishReadingSession({
+        sessionId: sid,
+        endTime: nowMs,
+        effectiveReadingSec: stateMachine.getEffectiveReadingSec(),
+        distractedSec: stateMachine.getDistractedSec(),
+        fatigueEventsCount: stateMachine.getFatigueEventsCount(),
+        avgBlinkRate: meanBlink,
+      });
+    },
+    [stateMachine]
+  );
+
+  // Carga calibración, contenido del documento (incl. base64 PDF/EPUB) y crea sesión
   useEffect(() => {
     let active = true;
     (async () => {
@@ -116,12 +144,19 @@ export default function ReaderScreen() {
         });
       }
 
-      if (mode === 'text' && docUri) {
+      if (docUri) {
         try {
-          const content = await FileSystem.readAsStringAsync(docUri);
-          if (active && content) setTextContent(content);
+          if (mode === 'text') {
+            const content = await FileSystem.readAsStringAsync(docUri);
+            if (active && content) setTextContent(content);
+          } else if (mode === 'pdf' || mode === 'epub') {
+            const b64 = await FileSystem.readAsStringAsync(docUri, {
+              encoding: FileSystem.EncodingType.Base64,
+            });
+            if (active && b64) setBase64Content(b64);
+          }
         } catch {
-          // Mantiene texto de muestra si falla la lectura local
+          // Mantiene contenido de respaldo si falla la lectura local
         }
       }
 
@@ -133,8 +168,21 @@ export default function ReaderScreen() {
 
     return () => {
       active = false;
+      // Cierre seguro ante gestos Back nativos o desmontaje abrupto
+      persistSessionSummary(true).catch(() => {});
     };
-  }, [docTitle, docUri, mode, vision]);
+  }, [docTitle, docUri, mode, vision, persistSessionSummary]);
+
+  // Guarda progreso cuando la app pasa a segundo plano o se apaga la pantalla
+  useEffect(() => {
+    const sub = AppState.addEventListener('change', (nextState) => {
+      if (nextState === 'background' || nextState === 'inactive') {
+        setIsPaused(true);
+        persistSessionSummary(false).catch(() => {});
+      }
+    });
+    return () => sub.remove();
+  }, [persistSessionSummary]);
 
   const onBiometricSample = useCallback(
     (sample: BiometricFrameSample) => {
@@ -149,26 +197,22 @@ export default function ReaderScreen() {
     {
       baselineEar,
       gazeBounds,
+      faceDetectorModel: vision.faceDetectorModel,
       isActive: !isPaused && vision.modelReady,
     },
     onBiometricSample
   );
 
-  // Reloj de lectura efectiva (1s)
+  // Reloj único de UI sincronizado con CognitiveStateMachine (1s)
   useEffect(() => {
     const tick = setInterval(() => {
-      if (isPausedRef.current) return;
-      if (stateMachine.getCurrentState() === 'LECTURA_ACTIVA') {
-        effectiveSecRef.current += 1;
-        setEffectiveReadingSec(effectiveSecRef.current);
-      } else if (stateMachine.getCurrentState() === 'DISTRACCION_BLOQUEO') {
-        distractedSecRef.current += 1;
-      }
+      const sec = stateMachine.advanceClock(Date.now(), isPausedRef.current);
+      setEffectiveReadingSec(sec);
     }, 1000);
     return () => clearInterval(tick);
   }, [stateMachine]);
 
-  // Evaluación de la máquina de estados cada 5 segundos
+  // Loop unificado: evalúa cada 5s y persiste snapshot cada 3 ticks (15s) sin recalcular dos veces
   useEffect(() => {
     const evalTimer = setInterval(() => {
       const nowMs = Date.now();
@@ -181,6 +225,8 @@ export default function ReaderScreen() {
 
       setCognitiveState(result.state);
       setStateReason(result.reason);
+      setEffectiveReadingSec(result.effectiveReadingSec);
+
       if (metrics.validFaceSampleCount > 0) {
         setAvgEar(metrics.avgEar);
         setBlinkRate(metrics.blinkRatePerMin);
@@ -195,61 +241,39 @@ export default function ReaderScreen() {
         if (result.alertToTrigger === 'DISTRACCION_HAPTIC') {
           setAmberHighlight(true);
         }
-        if (result.alertToTrigger === 'FATIGA_NOTIFICATION') {
-          fatigueEventsRef.current += 1;
-        }
         if (result.shouldPauseEffectiveReading) {
           setIsPaused(true);
           setShowBreakModal(true);
         }
         dispatchCognitiveAlert(result.alertToTrigger).catch(() => {});
       }
+
+      evalTickCountRef.current += 1;
+      const sid = sessionIdRef.current;
+      if (
+        sid &&
+        !isPausedRef.current &&
+        evalTickCountRef.current % 3 === 0
+      ) {
+        const offsetSec = Math.round((nowMs - sessionStartRef.current) / 1000);
+        insertTelemetrySnapshot({
+          sessionId: sid,
+          timestampOffsetSec: offsetSec,
+          cognitiveState: result.state,
+          avgEar:
+            metrics.validFaceSampleCount > 0 ? metrics.avgEar : baselineEar,
+          saccadeFrequency: metrics.saccadeFrequencyHz,
+        }).catch(() => {});
+      }
     }, STATE_EVALUATION_INTERVAL_MS);
 
     return () => clearInterval(evalTimer);
-  }, [slidingWindow, stateMachine]);
-
-  // Persistencia de snapshots en SQLite cada 15 segundos
-  useEffect(() => {
-    const snapTimer = setInterval(() => {
-      const sid = sessionIdRef.current;
-      if (!sid || isPausedRef.current) return;
-
-      const nowMs = Date.now();
-      const metrics = slidingWindow.computeMetrics(nowMs);
-      const offsetSec = Math.round((nowMs - sessionStartRef.current) / 1000);
-
-      insertTelemetrySnapshot({
-        sessionId: sid,
-        timestampOffsetSec: offsetSec,
-        cognitiveState: stateMachine.getCurrentState(),
-        avgEar:
-          metrics.validFaceSampleCount > 0 ? metrics.avgEar : baselineEar,
-        saccadeFrequency: metrics.saccadeFrequencyHz,
-      }).catch(() => {});
-    }, SNAPSHOT_INTERVAL_MS);
-
-    return () => clearInterval(snapTimer);
   }, [slidingWindow, stateMachine, baselineEar]);
 
   const handleEndSession = async () => {
     const sid = sessionIdRef.current;
+    await persistSessionSummary(true);
     if (sid) {
-      const samples = blinkRateSamplesRef.current;
-      const meanBlink =
-        samples.length > 0
-          ? samples.reduce((a, b) => a + b, 0) / samples.length
-          : 0;
-
-      await finishReadingSession({
-        sessionId: sid,
-        endTime: Date.now(),
-        effectiveReadingSec: effectiveSecRef.current,
-        distractedSec: distractedSecRef.current,
-        fatigueEventsCount: fatigueEventsRef.current,
-        avgBlinkRate: meanBlink,
-      });
-
       router.replace(`/session/${sid}`);
     } else {
       router.back();
@@ -264,7 +288,6 @@ export default function ReaderScreen() {
 
   return (
     <SafeAreaView style={styles.container}>
-      {/* Cámara frontal en segundo plano dentro de la vista activa */}
       {vision.device && vision.hasPermission && (
         <Camera
           style={styles.hiddenCamera}
@@ -277,7 +300,6 @@ export default function ReaderScreen() {
         />
       )}
 
-      {/* Barra superior del lector */}
       <View style={styles.topBar}>
         <Pressable style={styles.endBtn} onPress={handleEndSession}>
           <Text style={styles.endBtnText}>Finalizar</Text>
@@ -305,7 +327,6 @@ export default function ReaderScreen() {
         )}
       </View>
 
-      {/* HUD Cognitivo flotante */}
       <View style={styles.hudWrapper}>
         <CognitiveHUD
           state={cognitiveState}
@@ -320,37 +341,14 @@ export default function ReaderScreen() {
         />
       </View>
 
-      {/* Visor integrado: Texto, WebView o PDF/EPUB */}
-      {mode === 'web' && docUri ? (
-        <WebView source={{ uri: docUri }} style={styles.webview} />
-      ) : mode === 'pdf' && docUri ? (
-        <WebView
-          source={{ uri: docUri }}
-          originWhitelist={['*']}
-          allowFileAccess
-          style={styles.webview}
-        />
-      ) : mode === 'epub' ? (
-        <View style={styles.fallbackBox}>
-          <Text style={styles.fallbackTitle}>Archivo EPUB seleccionado</Text>
-          <Text style={styles.fallbackText}>
-            {docUri
-              ? `Ruta local: ${docUri}\n\nPara renderizado completo EPUB con paginación personalizada, conecta un extractor ZIP/HTML hacia el WebView.`
-              : 'No se recibió ruta del archivo.'}
-          </Text>
-        </View>
-      ) : (
-        <ScrollView
-          style={styles.textScroll}
-          contentContainerStyle={styles.textScrollContent}
-        >
-          <Text style={[styles.readerBody, { fontSize, lineHeight: fontSize * 1.6 }]}>
-            {textContent}
-          </Text>
-        </ScrollView>
-      )}
+      <DocumentViewer
+        mode={mode}
+        uri={docUri}
+        textContent={textContent}
+        base64Content={base64Content}
+        fontSize={fontSize}
+      />
 
-      {/* Modal de descanso 20-20-20 */}
       <Modal visible={showBreakModal} transparent animationType="fade">
         <View style={styles.modalBackdrop}>
           <View style={styles.modalCard}>
@@ -429,37 +427,6 @@ const styles = StyleSheet.create({
   hudWrapper: {
     paddingHorizontal: 14,
     paddingVertical: 10,
-  },
-  textScroll: {
-    flex: 1,
-  },
-  textScrollContent: {
-    paddingHorizontal: 22,
-    paddingTop: 10,
-    paddingBottom: 60,
-  },
-  readerBody: {
-    color: '#E2E8F0',
-  },
-  webview: {
-    flex: 1,
-    backgroundColor: '#0B1120',
-  },
-  fallbackBox: {
-    flex: 1,
-    padding: 24,
-    justifyContent: 'center',
-    gap: 10,
-  },
-  fallbackTitle: {
-    color: '#F8FAFC',
-    fontSize: 16,
-    fontWeight: '700',
-  },
-  fallbackText: {
-    color: '#94A3B8',
-    fontSize: 13,
-    lineHeight: 20,
   },
   modalBackdrop: {
     flex: 1,

@@ -128,6 +128,7 @@ export class BiometricSlidingWindow {
     let saccadeCount = 0;
 
     let fixationStartMs: number | null = null;
+    let closedInFixationStartMs: number | null = null;
     let maxContinuousFixationMs = 0;
 
     let outOfBoundsStartMs: number | null = null;
@@ -136,6 +137,7 @@ export class BiometricSlidingWindow {
     for (const s of samples) {
       if (!s.faceDetected) {
         fixationStartMs = null;
+        closedInFixationStartMs = null;
         if (outOfBoundsStartMs === null) {
           outOfBoundsStartMs = s.timestampMs;
         }
@@ -161,17 +163,37 @@ export class BiometricSlidingWindow {
         saccadeCount++;
       }
 
-      // Duración continua de mirada fija (ojos abiertos + dentro de pantalla + ΔX ≈ 0)
-      if (!s.isEyeClosed && s.isWithinBounds && s.isFixated) {
-        if (fixationStartMs === null) {
-          fixationStartMs = s.timestampMs;
+      // Duración continua de mirada fija con tolerancia a parpadeos fisiológicos (<= 400 ms)
+      if (s.isWithinBounds && (s.isFixated || s.isEyeClosed)) {
+        if (s.isEyeClosed) {
+          if (closedInFixationStartMs === null) {
+            closedInFixationStartMs = s.timestampMs;
+          }
+          if (
+            s.timestampMs - closedInFixationStartMs >
+            LONG_BLINK_THRESHOLD_MS
+          ) {
+            // Cierre prolongado (> 400 ms): ya no es fijación, cuenta como fatiga
+            fixationStartMs = null;
+          } else if (fixationStartMs !== null) {
+            maxContinuousFixationMs = Math.max(
+              maxContinuousFixationMs,
+              s.timestampMs - fixationStartMs
+            );
+          }
+        } else {
+          closedInFixationStartMs = null;
+          if (fixationStartMs === null) {
+            fixationStartMs = s.timestampMs;
+          }
+          maxContinuousFixationMs = Math.max(
+            maxContinuousFixationMs,
+            s.timestampMs - fixationStartMs
+          );
         }
-        maxContinuousFixationMs = Math.max(
-          maxContinuousFixationMs,
-          s.timestampMs - fixationStartMs
-        );
       } else {
         fixationStartMs = null;
+        closedInFixationStartMs = null;
       }
 
       // Duración continua de iris fuera de límites calibrados o cabeza desalineada

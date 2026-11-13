@@ -1,6 +1,8 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { Platform } from 'react-native';
 import { Asset } from 'expo-asset';
+import * as DocumentPicker from 'expo-document-picker';
+import * as FileSystem from 'expo-file-system';
 import {
   loadTensorflowModel,
   TensorflowModel,
@@ -12,31 +14,58 @@ import {
   useCameraFormat,
   useCameraPermission,
 } from 'react-native-vision-camera';
+import { BUNDLED_MODEL_MODULES } from './modelAssets';
 
-const MODEL_PATH_HINT = 'assets/models/face_landmarks_detector.tflite';
+export const LANDMARK_MODEL_FILENAME = 'face_landmarks_detector.tflite';
+export const DETECTOR_MODEL_FILENAME = 'face_detector.tflite';
+
+const MODELS_DIR = `${FileSystem.documentDirectory ?? ''}models/`;
 
 export interface VisionPipelineStatus {
   model: TensorflowModel | undefined;
+  faceDetectorModel: TensorflowModel | undefined;
   modelReady: boolean;
+  detectorReady: boolean;
   modelPathHint: string;
   activeDelegate: TensorflowModelDelegate | null;
   device: ReturnType<typeof useCameraDevice>;
   format: ReturnType<typeof useCameraFormat>;
   hasPermission: boolean;
   requestPermission: () => Promise<boolean>;
+  importLocalModel: (
+    kind: 'landmarks' | 'detector'
+  ) => Promise<boolean>;
+}
+
+async function resolveModelUri(
+  bundledModule: number | null,
+  localFilename: string
+): Promise<string | null> {
+  const localPath = `${MODELS_DIR}${localFilename}`;
+  try {
+    const localInfo = await FileSystem.getInfoAsync(localPath);
+    if (localInfo.exists) {
+      return localPath;
+    }
+  } catch {
+    // Continuar con asset empaquetado si existe
+  }
+
+  if (bundledModule !== null) {
+    const asset = Asset.fromModule(bundledModule);
+    await asset.downloadAsync();
+    return asset.localUri ?? asset.uri;
+  }
+
+  return null;
 }
 
 /**
- * Carga un modelo TFLite embebido en el bundle intentando primero aceleración
- * por GPU/CoreML y haciendo fallback automático a CPU ('default').
+ * Carga un modelo TFLite intentando primero GPU/CoreML y haciendo fallback a CPU ('default').
  */
-async function loadBundledModelWithFallback(
-  assetModule: number
+async function loadModelWithDelegateFallback(
+  modelUrl: string
 ): Promise<{ model: TensorflowModel; delegate: TensorflowModelDelegate }> {
-  const asset = Asset.fromModule(assetModule);
-  await asset.downloadAsync();
-  const modelUrl = asset.localUri ?? asset.uri;
-
   const delegates: TensorflowModelDelegate[] =
     Platform.OS === 'android'
       ? ['android-gpu', 'default']
@@ -61,7 +90,7 @@ async function loadBundledModelWithFallback(
 
 /**
  * Hook compartido para permisos de cámara frontal (480p @ 15 FPS)
- * y carga offline del modelo `face_landmarks_detector.tflite` desde `assets/models/`.
+ * y carga segura sin errores estáticos de Metro cuando los `.tflite` aún no están en `assets/models/`.
  */
 export function useVisionTelemetrySetup(): VisionPipelineStatus {
   const { hasPermission, requestPermission } = useCameraPermission();
@@ -72,41 +101,82 @@ export function useVisionTelemetrySetup(): VisionPipelineStatus {
   ]);
 
   const [model, setModel] = useState<TensorflowModel | undefined>(undefined);
+  const [faceDetectorModel, setFaceDetectorModel] = useState<
+    TensorflowModel | undefined
+  >(undefined);
   const [activeDelegate, setActiveDelegate] =
     useState<TensorflowModelDelegate | null>(null);
 
-  useEffect(() => {
-    let mounted = true;
-    (async () => {
-      try {
-        // eslint-disable-next-line @typescript-eslint/no-require-imports
-        const bundledModule = require('../../../assets/models/face_landmarks_detector.tflite');
-        const result = await loadBundledModelWithFallback(bundledModule);
-        if (mounted) {
-          setModel(result.model);
-          setActiveDelegate(result.delegate);
-        }
-      } catch (err) {
-        console.warn(
-          `[EyeTelemetry] Modelo no cargado (${MODEL_PATH_HINT}):`,
-          err
-        );
+  const loadModels = useCallback(async () => {
+    try {
+      const landmarkUri = await resolveModelUri(
+        BUNDLED_MODEL_MODULES.landmarks,
+        LANDMARK_MODEL_FILENAME
+      );
+      if (landmarkUri) {
+        const res = await loadModelWithDelegateFallback(landmarkUri);
+        setModel(res.model);
+        setActiveDelegate(res.delegate);
       }
-    })();
-    return () => {
-      mounted = false;
-    };
+
+      const detectorUri = await resolveModelUri(
+        BUNDLED_MODEL_MODULES.detector,
+        DETECTOR_MODEL_FILENAME
+      );
+      if (detectorUri) {
+        const detRes = await loadModelWithDelegateFallback(detectorUri);
+        setFaceDetectorModel(detRes.model);
+      }
+    } catch (err) {
+      console.warn('[EyeTelemetry] Error cargando modelos TFLite:', err);
+    }
   }, []);
+
+  useEffect(() => {
+    loadModels().catch(() => {});
+  }, [loadModels]);
+
+  const importLocalModel = useCallback(
+    async (kind: 'landmarks' | 'detector'): Promise<boolean> => {
+      const picked = await DocumentPicker.getDocumentAsync({
+        type: ['application/octet-stream', '*/*'],
+        copyToCacheDirectory: true,
+      });
+
+      if (picked.canceled || !picked.assets?.[0]) {
+        return false;
+      }
+
+      const targetName =
+        kind === 'landmarks'
+          ? LANDMARK_MODEL_FILENAME
+          : DETECTOR_MODEL_FILENAME;
+
+      await FileSystem.makeDirectoryAsync(MODELS_DIR, { intermediates: true });
+      const destUri = `${MODELS_DIR}${targetName}`;
+      await FileSystem.copyAsync({
+        from: picked.assets[0].uri,
+        to: destUri,
+      });
+
+      await loadModels();
+      return true;
+    },
+    [loadModels]
+  );
 
   return {
     model,
+    faceDetectorModel,
     modelReady: Boolean(model),
-    modelPathHint: MODEL_PATH_HINT,
+    detectorReady: Boolean(faceDetectorModel),
+    modelPathHint: `assets/models/${LANDMARK_MODEL_FILENAME}`,
     activeDelegate,
     device,
     format,
     hasPermission,
     requestPermission,
+    importLocalModel,
   };
 }
 

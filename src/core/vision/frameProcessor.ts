@@ -6,47 +6,44 @@ import { useResizePlugin } from 'vision-camera-resize-plugin';
 import {
   BlinkTrackerState,
   DEFAULT_BASELINE_EAR,
-  evaluateEar,
+  evaluateEarFromTensor,
 } from '../biometrics/earEngine';
-import { evaluateHeadPose } from '../biometrics/headPoseEngine';
+import { evaluateHeadPoseFromTensor } from '../biometrics/headPoseEngine';
 import {
   DEFAULT_GAZE_BOUNDS,
-  evaluateSaccade,
+  evaluateSaccadeFromTensor,
   GazeCalibrationBounds,
   IrisCentroid,
 } from '../biometrics/saccadeEngine';
 import { BiometricFrameSample } from '../cognitive/slidingWindow';
-import { LandmarkPoint, TOTAL_FACE_LANDMARKS } from './landmarkIndices';
+import {
+  BLAZEFACE_INPUT_SIZE,
+  decodeBlazeFaceBestBox,
+} from './blazefaceDecoder';
+import {
+  FaceCropRect,
+  LandmarkPoint,
+  resolveFlatTensorScale,
+  TOTAL_FACE_LANDMARKS,
+} from './landmarkIndices';
 
 export const TARGET_CAMERA_FPS = 15;
 export const FACE_LANDMARK_INPUT_SIZE = 192;
-export const FACE_DETECTOR_INPUT_SIZE = 128;
 
 export type ResizeRotation = '0deg' | '90deg' | '180deg' | '270deg';
-
-export interface FaceCropRect {
-  x: number;
-  y: number;
-  width: number;
-  height: number;
-}
 
 export interface TelemetryPipelineConfig {
   baselineEar: number;
   gazeBounds: GazeCalibrationBounds;
   isActive: boolean;
-  /** Modelo opcional de 1.ª etapa (face_detector.tflite) para recorte ROI */
+  /** Modelo opcional de 1.ª etapa (face_detector.tflite / BlazeFace SSD) para recorte ROI */
   faceDetectorModel?: TensorflowModel;
-  /**
-   * Rotación manual para `vision-camera-resize-plugin` ('0deg' | '90deg' | '180deg' | '270deg').
-   * Útil en Android si la cámara frontal entrega frames rotados 90° o 270° respecto a portrait.
-   */
+  /** Rotación manual ('0deg' | '90deg' | '180deg' | '270deg') para sensores Android */
   rotation?: ResizeRotation;
 }
 
 /**
  * Mapea `frame.orientation` de Vision Camera a la rotación de `resize(...)`.
- * Si se pasa `overrideRotation`, tiene prioridad para calibrar sensores Android específicos.
  */
 export function resolveFrameRotation(
   frameOrientation: string,
@@ -69,8 +66,51 @@ export function resolveFrameRotation(
 }
 
 /**
- * Convierte la salida plana del modelo TFLite de MediaPipe (478 x 3)
- * a coordenadas normalizadas [0, 1]. Descarta salidas con valores NaN/Inf.
+ * Normaliza un tensor RGB Float32 in-place (cero asignaciones):
+ * - Si los valores están en [0, 255], los lleva a [0.0, 1.0] o [-1.0, 1.0].
+ * - Si ya están en [0.0, 1.0] y targetRange es '-1_1', aplica (x * 2 - 1).
+ */
+export function normalizeRgbTensorInPlace(
+  tensor: Float32Array,
+  targetRange: '0_1' | '-1_1'
+): void {
+  'worklet';
+  const len = tensor.length;
+  if (len === 0) return;
+
+  let maxVal = 0;
+  const probeLimit = Math.min(len, 96);
+  for (let i = 0; i < probeLimit; i++) {
+    const v = tensor[i];
+    if (v > maxVal) maxVal = v;
+  }
+
+  const isByteRange = maxVal > 1.5;
+
+  if (targetRange === '0_1') {
+    if (!isByteRange) return;
+    const inv255 = 1 / 255;
+    for (let i = 0; i < len; i++) {
+      tensor[i] *= inv255;
+    }
+    return;
+  }
+
+  // targetRange === '-1_1' (requerido por BlazeFace short-range)
+  if (isByteRange) {
+    const inv127_5 = 1 / 127.5;
+    for (let i = 0; i < len; i++) {
+      tensor[i] = tensor[i] * inv127_5 - 1;
+    }
+  } else {
+    for (let i = 0; i < len; i++) {
+      tensor[i] = tensor[i] * 2 - 1;
+    }
+  }
+}
+
+/**
+ * Parser completo de 478 landmarks (mantenido para utilidades/pruebas fuera del hot path).
  */
 export function parseFaceLandmarksOutput(
   rawTensor: ArrayLike<number> | undefined,
@@ -78,43 +118,26 @@ export function parseFaceLandmarksOutput(
   cropRect?: FaceCropRect
 ): LandmarkPoint[] | null {
   'worklet';
-  if (!rawTensor || rawTensor.length < TOTAL_FACE_LANDMARKS * 3) {
+  const scale = resolveFlatTensorScale(rawTensor, inputSize);
+  if (scale === null || !rawTensor) {
     return null;
   }
-
-  let maxCoord = 0;
-  for (let i = 0; i < 30; i++) {
-    const val = rawTensor[i];
-    if (!Number.isFinite(val)) {
-      return null;
-    }
-    const absVal = Math.abs(val);
-    if (absVal > maxCoord) maxCoord = absVal;
-  }
-  const scale = maxCoord > 2.0 ? 1 / inputSize : 1;
 
   const landmarks = new Array<LandmarkPoint>(TOTAL_FACE_LANDMARKS);
   for (let i = 0; i < TOTAL_FACE_LANDMARKS; i++) {
     const offset = i * 3;
-    const rawX = rawTensor[offset];
-    const rawY = rawTensor[offset + 1];
-    const rawZ = rawTensor[offset + 2];
-
-    if (
-      !Number.isFinite(rawX) ||
-      !Number.isFinite(rawY) ||
-      !Number.isFinite(rawZ)
-    ) {
+    const x = rawTensor[offset];
+    const y = rawTensor[offset + 1];
+    const z = rawTensor[offset + 2];
+    if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) {
       return null;
     }
-
-    const normX = rawX * scale;
-    const normY = rawY * scale;
-
+    const normX = x * scale;
+    const normY = y * scale;
     landmarks[i] = {
       x: cropRect ? cropRect.x + normX * cropRect.width : normX,
       y: cropRect ? cropRect.y + normY * cropRect.height : normY,
-      z: rawZ * scale,
+      z: z * scale,
     };
   }
 
@@ -122,11 +145,13 @@ export function parseFaceLandmarksOutput(
 }
 
 /**
- * Ejecuta el cálculo biométrico completo sobre un frame dentro del hilo Worklet,
- * aplicando suavizado EMA de 3 frames sobre las coordenadas del iris.
+ * Procesa el tensor plano directamente en el Worklet leyendo únicamente los 27 índices
+ * necesarios (sin instanciar 478 objetos ni arreglos en cada frame).
  */
-export function processLandmarksInWorklet(
-  landmarks: LandmarkPoint[] | null,
+export function processFlatTensorInWorklet(
+  rawTensor: ArrayLike<number> | undefined,
+  inputSize: number,
+  cropRect: FaceCropRect | undefined,
   timestampMs: number,
   baselineEar: number,
   gazeBounds: GazeCalibrationBounds,
@@ -138,7 +163,8 @@ export function processLandmarksInWorklet(
   nextSmoothedGaze: IrisCentroid | null;
 } {
   'worklet';
-  if (!landmarks) {
+  const scale = resolveFlatTensorScale(rawTensor, inputSize);
+  if (scale === null || !rawTensor) {
     return {
       sample: {
         timestampMs,
@@ -160,9 +186,22 @@ export function processLandmarksInWorklet(
     };
   }
 
-  const earEval = evaluateEar(landmarks, baselineEar, blinkState, timestampMs);
-  const saccadeEval = evaluateSaccade(landmarks, prevSmoothedGaze, gazeBounds);
-  const headEval = evaluateHeadPose(landmarks);
+  const earEval = evaluateEarFromTensor(
+    rawTensor,
+    scale,
+    cropRect,
+    baselineEar,
+    blinkState,
+    timestampMs
+  );
+  const saccadeEval = evaluateSaccadeFromTensor(
+    rawTensor,
+    scale,
+    cropRect,
+    prevSmoothedGaze,
+    gazeBounds
+  );
+  const headEval = evaluateHeadPoseFromTensor(rawTensor, scale, cropRect);
 
   return {
     sample: {
@@ -189,54 +228,10 @@ export function processLandmarksInWorklet(
 }
 
 /**
- * Extrae el recorte ROI cuadrado en píxeles de frame cuando está disponible
- * la salida de `face_detector.tflite` (formato [ymin, xmin, ymax, xmax] o [cx, cy, w, h]).
- */
-function extractFaceCropFromDetector(
-  detectorOutput: ArrayLike<number> | undefined,
-  frameWidth: number,
-  frameHeight: number
-): { pixelCrop: FaceCropRect; normCrop: FaceCropRect } | undefined {
-  'worklet';
-  if (!detectorOutput || detectorOutput.length < 4) {
-    return undefined;
-  }
-
-  const cx = detectorOutput[0];
-  const cy = detectorOutput[1];
-  const w = detectorOutput[2];
-  const h = detectorOutput[3];
-  if (
-    !Number.isFinite(cx) ||
-    !Number.isFinite(cy) ||
-    !Number.isFinite(w) ||
-    !Number.isFinite(h) ||
-    w <= 0.05 ||
-    h <= 0.05
-  ) {
-    return undefined;
-  }
-
-  const normX = Math.max(0, Math.min(1, cx / FACE_DETECTOR_INPUT_SIZE - (w / FACE_DETECTOR_INPUT_SIZE) * 0.65));
-  const normY = Math.max(0, Math.min(1, cy / FACE_DETECTOR_INPUT_SIZE - (h / FACE_DETECTOR_INPUT_SIZE) * 0.65));
-  const normW = Math.min(1 - normX, (w / FACE_DETECTOR_INPUT_SIZE) * 1.3);
-  const normH = Math.min(1 - normY, (h / FACE_DETECTOR_INPUT_SIZE) * 1.3);
-
-  return {
-    pixelCrop: {
-      x: Math.round(normX * frameWidth),
-      y: Math.round(normY * frameHeight),
-      width: Math.max(1, Math.round(normW * frameWidth)),
-      height: Math.max(1, Math.round(normH * frameHeight)),
-    },
-    normCrop: { x: normX, y: normY, width: normW, height: normH },
-  };
-}
-
-/**
- * Hook de Vision Camera que convierte el frame YUV a RGB Float32 (192x192)
- * con `vision-camera-resize-plugin`, ejecuta MediaPipe TFLite en GPU/CPU
- * y envía muestras compactas al hilo JS.
+ * Hook de Vision Camera:
+ * 1) Opcionalmente detecta ROI facial con BlazeFace SSD (896 anclas + sigmoide)
+ * 2) Reeescala y convierte YUV -> RGB Float32 [0.0, 1.0] (192x192) con crop ROI
+ * 3) Evalúa biometría con cero asignaciones de objetos de malla en el worklet JSI
  */
 export function useBiometricFrameProcessor(
   model: TensorflowModel | undefined,
@@ -293,31 +288,72 @@ export function useBiometricFrameProcessor(
         overrideRotation
       );
 
-      // Etapa opcional 1: Detección de ROI facial si se provee face_detector.tflite
+      // Etapa 1 (opcional): BlazeFace SSD [1, 896, 16] + [1, 896, 1] con normalización [-1, 1]
       let cropInfo:
-        | { pixelCrop: FaceCropRect; normCrop: FaceCropRect }
+        | { pixelCrop: FaceCropRect; normCrop: FaceCropRect; score: number }
         | undefined;
       if (faceDetectorModel) {
         const detectorInput = resize(frame, {
           scale: {
-            width: FACE_DETECTOR_INPUT_SIZE,
-            height: FACE_DETECTOR_INPUT_SIZE,
+            width: BLAZEFACE_INPUT_SIZE,
+            height: BLAZEFACE_INPUT_SIZE,
           },
           pixelFormat: 'rgb',
           dataType: 'float32',
           rotation,
         });
+        normalizeRgbTensorInPlace(detectorInput, '-1_1');
+
         const detectorOut = faceDetectorModel.runSync([detectorInput]);
-        cropInfo = extractFaceCropFromDetector(
+        cropInfo = decodeBlazeFaceBestBox(
           detectorOut[0] as ArrayLike<number> | undefined,
+          detectorOut[1] as ArrayLike<number> | undefined,
           frame.width,
           frame.height
         );
+
+        // Si el detector está cargado pero no encuentra rostro con confianza >= 0.5, reportamos sin rostro
+        if (!cropInfo) {
+          const emptyRes = processFlatTensorInWorklet(
+            undefined,
+            FACE_LANDMARK_INPUT_SIZE,
+            undefined,
+            nowMs,
+            baselineEar,
+            gazeBounds,
+            blinkStateShared.value,
+            smoothedGazeShared.value
+          );
+          blinkStateShared.value = emptyRes.nextBlinkState;
+          smoothedGazeShared.value = emptyRes.nextSmoothedGaze;
+          emitSampleToJS(emptyRes.sample);
+          return;
+        }
+      } else {
+        // Fallback en modo 1 modelo: recorte cuadrado centrado (75% del encuadre) para lectura a 30-40 cm
+        const sideNorm = 0.75;
+        const xNorm = (1 - sideNorm) * 0.5;
+        const yNorm = (1 - sideNorm) * 0.5;
+        cropInfo = {
+          pixelCrop: {
+            x: Math.round(xNorm * frame.width),
+            y: Math.round(yNorm * frame.height),
+            width: Math.max(1, Math.round(sideNorm * frame.width)),
+            height: Math.max(1, Math.round(sideNorm * frame.height)),
+          },
+          normCrop: {
+            x: xNorm,
+            y: yNorm,
+            width: sideNorm,
+            height: sideNorm,
+          },
+          score: 1,
+        };
       }
 
-      // Conversión crítica YUV_420_888 -> RGB Float32 reescalado a 192x192 con compensación de orientación
+      // Etapa 2: Recorte ROI + RGB Float32 normalizado [0.0, 1.0] (192x192)
       const resizedRgbFloat32 = resize(frame, {
-        ...(cropInfo ? { crop: cropInfo.pixelCrop } : {}),
+        crop: cropInfo.pixelCrop,
         scale: {
           width: FACE_LANDMARK_INPUT_SIZE,
           height: FACE_LANDMARK_INPUT_SIZE,
@@ -326,16 +362,13 @@ export function useBiometricFrameProcessor(
         dataType: 'float32',
         rotation,
       });
+      normalizeRgbTensorInPlace(resizedRgbFloat32, '0_1');
 
       const outputs = model.runSync([resizedRgbFloat32]);
-      const landmarks = parseFaceLandmarksOutput(
+      const result = processFlatTensorInWorklet(
         outputs[0] as ArrayLike<number> | undefined,
         FACE_LANDMARK_INPUT_SIZE,
-        cropInfo?.normCrop
-      );
-
-      const result = processLandmarksInWorklet(
-        landmarks,
+        cropInfo.normCrop,
         nowMs,
         baselineEar,
         gazeBounds,

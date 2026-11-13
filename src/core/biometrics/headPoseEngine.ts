@@ -1,7 +1,10 @@
 import {
+  FaceCropRect,
   HEAD_POSE_INDICES,
   LandmarkPoint,
-  distance2D,
+  distance2DCoords,
+  readTensorX,
+  readTensorY,
 } from '../vision/landmarkIndices';
 
 export const MAX_ALIGNED_YAW_DEG = 25;
@@ -19,9 +22,49 @@ function clamp(val: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, val));
 }
 
+function computeHeadPoseFromScalars(
+  noseX: number,
+  noseY: number,
+  foreheadY: number,
+  chinY: number,
+  leftEyeX: number,
+  leftEyeY: number,
+  rightEyeX: number,
+  rightEyeY: number
+): HeadPoseEvaluation {
+  'worklet';
+  const eyeMidX = (leftEyeX + rightEyeX) * 0.5;
+  const eyeMidY = (leftEyeY + rightEyeY) * 0.5;
+  const interOcularDist = Math.max(
+    distance2DCoords(leftEyeX, leftEyeY, rightEyeX, rightEyeY),
+    1e-5
+  );
+
+  const yawRatio = (noseX - eyeMidX) / (interOcularDist * 0.5);
+  const yawDeg = clamp(yawRatio * 45, -90, 90);
+
+  const faceVerticalSpan = Math.max(Math.abs(chinY - foreheadY), 1e-5);
+  const neutralNoseOffset = 0.22;
+  const noseVerticalRatio = (noseY - eyeMidY) / faceVerticalSpan - neutralNoseOffset;
+  const pitchDeg = clamp(noseVerticalRatio * 140, -90, 90);
+
+  const rollRad = Math.atan2(rightEyeY - leftEyeY, rightEyeX - leftEyeX);
+  const rollDeg = (rollRad * 180) / Math.PI;
+
+  const isAligned =
+    Math.abs(yawDeg) <= MAX_ALIGNED_YAW_DEG &&
+    Math.abs(pitchDeg) <= MAX_ALIGNED_PITCH_DEG;
+
+  return {
+    pitchDeg,
+    yawDeg,
+    rollDeg,
+    isAligned,
+  };
+}
+
 /**
- * Estima Pitch (inclinación arriba/abajo), Yaw (rotación izq/der) y Roll
- * a partir de proporciones geométricas 2D/3D de la malla facial MediaPipe.
+ * Estima Pitch, Yaw y Roll desde un arreglo de Landmarks.
  */
 export function evaluateHeadPose(
   landmarks: readonly LandmarkPoint[]
@@ -37,32 +80,40 @@ export function evaluateHeadPose(
     return { pitchDeg: 0, yawDeg: 0, rollDeg: 0, isAligned: false };
   }
 
-  const eyeMidX = (leftEye.x + rightEye.x) * 0.5;
-  const eyeMidY = (leftEye.y + rightEye.y) * 0.5;
-  const interOcularDist = Math.max(distance2D(leftEye, rightEye), 1e-5);
+  return computeHeadPoseFromScalars(
+    nose.x,
+    nose.y,
+    forehead.y,
+    chin.y,
+    leftEye.x,
+    leftEye.y,
+    rightEye.x,
+    rightEye.y
+  );
+}
 
-  // Yaw: desplazamiento horizontal de la punta de la nariz respecto al punto medio ocular
-  const yawRatio = (nose.x - eyeMidX) / (interOcularDist * 0.5);
-  const yawDeg = clamp(yawRatio * 45, -90, 90);
+/**
+ * Estima pose de cabeza indexando directamente el tensor plano (cero asignaciones GC).
+ */
+export function evaluateHeadPoseFromTensor(
+  rawTensor: ArrayLike<number>,
+  scale: number,
+  cropRect: FaceCropRect | undefined
+): HeadPoseEvaluation {
+  'worklet';
+  const cropX = cropRect ? cropRect.x : 0;
+  const cropY = cropRect ? cropRect.y : 0;
+  const cropW = cropRect ? cropRect.width : 1;
+  const cropH = cropRect ? cropRect.height : 1;
 
-  // Pitch: posición vertical relativa de la nariz entre el punto medio ocular y el mentón
-  const faceVerticalSpan = Math.max(Math.abs(chin.y - forehead.y), 1e-5);
-  const neutralNoseOffset = 0.22; // proporción anatómica neutra bajo los ojos
-  const noseVerticalRatio = (nose.y - eyeMidY) / faceVerticalSpan - neutralNoseOffset;
-  const pitchDeg = clamp(noseVerticalRatio * 140, -90, 90);
-
-  // Roll: inclinación lateral de la línea entre comisuras oculares externas
-  const rollRad = Math.atan2(rightEye.y - leftEye.y, rightEye.x - leftEye.x);
-  const rollDeg = (rollRad * 180) / Math.PI;
-
-  const isAligned =
-    Math.abs(yawDeg) <= MAX_ALIGNED_YAW_DEG &&
-    Math.abs(pitchDeg) <= MAX_ALIGNED_PITCH_DEG;
-
-  return {
-    pitchDeg,
-    yawDeg,
-    rollDeg,
-    isAligned,
-  };
+  return computeHeadPoseFromScalars(
+    readTensorX(rawTensor, HEAD_POSE_INDICES.noseTip, scale, cropX, cropW),
+    readTensorY(rawTensor, HEAD_POSE_INDICES.noseTip, scale, cropY, cropH),
+    readTensorY(rawTensor, HEAD_POSE_INDICES.forehead, scale, cropY, cropH),
+    readTensorY(rawTensor, HEAD_POSE_INDICES.chin, scale, cropY, cropH),
+    readTensorX(rawTensor, HEAD_POSE_INDICES.leftEyeOuter, scale, cropX, cropW),
+    readTensorY(rawTensor, HEAD_POSE_INDICES.leftEyeOuter, scale, cropY, cropH),
+    readTensorX(rawTensor, HEAD_POSE_INDICES.rightEyeOuter, scale, cropX, cropW),
+    readTensorY(rawTensor, HEAD_POSE_INDICES.rightEyeOuter, scale, cropY, cropH)
+  );
 }

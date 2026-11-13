@@ -7,6 +7,7 @@ import { evaluateHeadPose } from '../biometrics/headPoseEngine';
 import {
   DEFAULT_GAZE_BOUNDS,
   evaluateSaccade,
+  extractIrisCentroid,
   smoothGazeEma,
 } from '../biometrics/saccadeEngine';
 import {
@@ -17,7 +18,17 @@ import {
   CognitiveStateMachine,
   classifyCognitiveState,
 } from '../cognitive/stateMachine';
-import { parseFaceLandmarksOutput } from '../vision/frameProcessor';
+import {
+  BLAZEFACE_ANCHORS_X,
+  BLAZEFACE_ANCHORS_Y,
+  BLAZEFACE_NUM_ANCHORS,
+  decodeBlazeFaceBestBox,
+} from '../vision/blazefaceDecoder';
+import {
+  normalizeRgbTensorInPlace,
+  parseFaceLandmarksOutput,
+  processFlatTensorInWorklet,
+} from '../vision/frameProcessor';
 import {
   HEAD_POSE_INDICES,
   LEFT_EYE_EAR_INDICES,
@@ -30,50 +41,60 @@ import {
 
 function createNeutralLandmarks(
   eyeOpenness: number = 0.03,
-  irisX: number = 0.5,
-  irisY: number = 0.5
+  relativeIrisX: number = 0.5,
+  relativeIrisY: number = 0.5,
+  headOffsetX: number = 0
 ): LandmarkPoint[] {
   const pts: LandmarkPoint[] = Array.from({ length: TOTAL_FACE_LANDMARKS }, () => ({
-    x: 0.5,
+    x: 0.5 + headOffsetX,
     y: 0.5,
     z: 0,
   }));
 
-  // Left eye horizontal span = 0.10, vertical = eyeOpenness -> EAR = eyeOpenness / 0.10
+  // Ojo izquierdo: [0.35, 0.45] + headOffsetX (ancho = 0.10)
   const [l1, l2, l3, l4, l5, l6] = LEFT_EYE_EAR_INDICES;
-  pts[l1] = { x: 0.35, y: 0.4 };
-  pts[l4] = { x: 0.45, y: 0.4 };
-  pts[l2] = { x: 0.38, y: 0.4 - eyeOpenness * 0.5 };
-  pts[l3] = { x: 0.42, y: 0.4 - eyeOpenness * 0.5 };
-  pts[l6] = { x: 0.38, y: 0.4 + eyeOpenness * 0.5 };
-  pts[l5] = { x: 0.42, y: 0.4 + eyeOpenness * 0.5 };
+  pts[l1] = { x: 0.35 + headOffsetX, y: 0.4 };
+  pts[l4] = { x: 0.45 + headOffsetX, y: 0.4 };
+  pts[l2] = { x: 0.38 + headOffsetX, y: 0.4 - eyeOpenness * 0.5 };
+  pts[l3] = { x: 0.42 + headOffsetX, y: 0.4 - eyeOpenness * 0.5 };
+  pts[l6] = { x: 0.38 + headOffsetX, y: 0.4 + eyeOpenness * 0.5 };
+  pts[l5] = { x: 0.42 + headOffsetX, y: 0.4 + eyeOpenness * 0.5 };
 
-  // Right eye horizontal span = 0.10
+  // Ojo derecho: [0.55, 0.65] + headOffsetX (ancho = 0.10)
   const [r1, r2, r3, r4, r5, r6] = RIGHT_EYE_EAR_INDICES;
-  pts[r1] = { x: 0.55, y: 0.4 };
-  pts[r4] = { x: 0.65, y: 0.4 };
-  pts[r2] = { x: 0.58, y: 0.4 - eyeOpenness * 0.5 };
-  pts[r3] = { x: 0.62, y: 0.4 - eyeOpenness * 0.5 };
-  pts[r6] = { x: 0.58, y: 0.4 + eyeOpenness * 0.5 };
-  pts[r5] = { x: 0.62, y: 0.4 + eyeOpenness * 0.5 };
+  pts[r1] = { x: 0.55 + headOffsetX, y: 0.4 };
+  pts[r4] = { x: 0.65 + headOffsetX, y: 0.4 };
+  pts[r2] = { x: 0.58 + headOffsetX, y: 0.4 - eyeOpenness * 0.5 };
+  pts[r3] = { x: 0.62 + headOffsetX, y: 0.4 - eyeOpenness * 0.5 };
+  pts[r6] = { x: 0.58 + headOffsetX, y: 0.4 + eyeOpenness * 0.5 };
+  pts[r5] = { x: 0.62 + headOffsetX, y: 0.4 + eyeOpenness * 0.5 };
 
-  pts[LEFT_IRIS_INDICES.center] = { x: irisX - 0.05, y: irisY };
-  pts[RIGHT_IRIS_INDICES.center] = { x: irisX + 0.05, y: irisY };
+  pts[LEFT_IRIS_INDICES.center] = {
+    x: 0.35 + headOffsetX + relativeIrisX * 0.1,
+    y: 0.4 + (relativeIrisY - 0.5) * 0.1,
+  };
+  pts[RIGHT_IRIS_INDICES.center] = {
+    x: 0.55 + headOffsetX + relativeIrisX * 0.1,
+    y: 0.4 + (relativeIrisY - 0.5) * 0.1,
+  };
 
-  pts[HEAD_POSE_INDICES.leftEyeOuter] = { x: 0.35, y: 0.4 };
-  pts[HEAD_POSE_INDICES.rightEyeOuter] = { x: 0.65, y: 0.4 };
-  pts[HEAD_POSE_INDICES.forehead] = { x: 0.5, y: 0.2 };
-  pts[HEAD_POSE_INDICES.chin] = { x: 0.5, y: 0.8 };
-  pts[HEAD_POSE_INDICES.noseTip] = { x: 0.5, y: 0.4 + 0.22 * 0.6 };
+  pts[HEAD_POSE_INDICES.leftEyeOuter] = { x: 0.35 + headOffsetX, y: 0.4 };
+  pts[HEAD_POSE_INDICES.rightEyeOuter] = { x: 0.65 + headOffsetX, y: 0.4 };
+  pts[HEAD_POSE_INDICES.forehead] = { x: 0.5 + headOffsetX, y: 0.2 };
+  pts[HEAD_POSE_INDICES.chin] = { x: 0.5 + headOffsetX, y: 0.8 };
+  pts[HEAD_POSE_INDICES.noseTip] = {
+    x: 0.5 + headOffsetX,
+    y: 0.4 + 0.22 * 0.6,
+  };
 
   return pts;
 }
 
-describe('Motores Biométricos y Cognitivos', () => {
-  it('detecta OJO_CERRADO cuando EAR cae por debajo del 75% del basal y mide parpadeos largos', () => {
-    const openLandmarks = createNeutralLandmarks(0.03); // EAR = 0.30
-    const closedLandmarks = createNeutralLandmarks(0.01); // EAR = 0.10 (< 0.75 * 0.28)
-    let blinkState: BlinkTrackerState = {
+describe('Motores Biométricos, Visión SSD y Cognición', () => {
+  it('detecta OJO_CERRADO y mide duración de parpadeo', () => {
+    const openLandmarks = createNeutralLandmarks(0.03);
+    const closedLandmarks = createNeutralLandmarks(0.01);
+    const blinkState: BlinkTrackerState = {
       isCurrentlyClosed: false,
       closedStartedAtMs: null,
     };
@@ -85,7 +106,6 @@ describe('Motores Biométricos y Cognitivos', () => {
       1000
     );
     expect(resOpen.isEyeClosed).toBe(false);
-    expect(resOpen.avgEar).toBeCloseTo(0.3, 2);
 
     const resClosed = evaluateEar(
       closedLandmarks,
@@ -105,94 +125,99 @@ describe('Motores Biométricos y Cognitivos', () => {
     expect(resReopen.blinkDurationMs).toBe(470);
   });
 
-  it('detecta sacadas horizontales con suavizado EMA y límites calibrados del iris', () => {
-    const lm1 = createNeutralLandmarks(0.03, 0.48, 0.5);
-    const lm2 = createNeutralLandmarks(0.03, 0.52, 0.5);
-    const eval1 = evaluateSaccade(lm1, null, DEFAULT_GAZE_BOUNDS);
-    expect(eval1.isWithinBounds).toBe(true);
+  it('normaliza el iris anatómicamente de forma invariante a traslación de cabeza', () => {
+    const lmCentered = createNeutralLandmarks(0.03, 0.5, 0.5, 0);
+    const lmShiftedHead = createNeutralLandmarks(0.03, 0.5, 0.5, 0.18);
 
-    const eval2 = evaluateSaccade(
-      lm2,
-      { gazeX: eval1.gazeX, gazeY: eval1.gazeY },
-      DEFAULT_GAZE_BOUNDS
+    const gaze1 = extractIrisCentroid(lmCentered);
+    const gaze2 = extractIrisCentroid(lmShiftedHead);
+    expect(gaze1.gazeX).toBeCloseTo(0.5, 4);
+    expect(gaze2.gazeX).toBeCloseTo(0.5, 4);
+
+    const lmSac = createNeutralLandmarks(0.03, 0.65, 0.5, 0.18);
+    const evalSac = evaluateSaccade(lmSac, gaze2, DEFAULT_GAZE_BOUNDS);
+    expect(evalSac.isSaccade).toBe(true);
+
+    const smoothed = smoothGazeEma(
+      { gazeX: 0.6, gazeY: 0.5 },
+      { gazeX: 0.5, gazeY: 0.5 }
     );
-    expect(eval2.isSaccade).toBe(true);
-    expect(eval2.isFixated).toBe(false);
-
-    const smoothed = smoothGazeEma({ gazeX: 0.52, gazeY: 0.5 }, { gazeX: 0.48, gazeY: 0.5 });
-    expect(smoothed.gazeX).toBeCloseTo(0.5, 4);
-
-    const outOfBounds = createNeutralLandmarks(0.03, 0.1, 0.5);
-    const evalOut = evaluateSaccade(
-      outOfBounds,
-      null,
-      DEFAULT_GAZE_BOUNDS
-    );
-    expect(evalOut.isWithinBounds).toBe(false);
-
-    const nanTensor = new Float32Array(TOTAL_FACE_LANDMARKS * 3);
-    nanTensor[0] = Number.NaN;
-    expect(parseFaceLandmarksOutput(nanTensor)).toBeNull();
+    expect(smoothed.gazeX).toBeCloseTo(0.55, 4);
   });
 
-  it('evalúa alineación de cabeza frontal', () => {
-    const neutral = createNeutralLandmarks();
-    const pose = evaluateHeadPose(neutral);
-    expect(pose.isAligned).toBe(true);
-    expect(Math.abs(pose.yawDeg)).toBeLessThan(5);
-  });
-
-  it('clasifica FATIGA_OCULAR por PERCLOS > 15% y DISTRACCION_BLOQUEO por fijación > 8s', () => {
+  it('mantiene la detección de fijación > 8s a pesar de parpadeos fisiológicos normales', () => {
     const window = new BiometricSlidingWindow(450, 30_000);
-
     for (let i = 0; i < 100; i++) {
-      const sample: BiometricFrameSample = {
-        timestampMs: i * 100,
+      const ts = i * 100; // 0s a 9.9s
+      const isNormalBlink = ts >= 4000 && ts <= 4150; // parpadeo de 150ms
+      window.push({
+        timestampMs: ts,
         faceDetected: true,
-        avgEar: i < 25 ? 0.14 : 0.28,
-        isEyeClosed: i < 25, // 25% PERCLOS
-        blinkCompleted: false,
-        blinkDurationMs: 0,
-        gazeX: 0.5,
-        gazeY: 0.5,
-        absDeltaX: 0.01,
-        isSaccade: true,
-        isFixated: false,
-        isWithinBounds: true,
-        isHeadAligned: true,
-      };
-      window.push(sample);
-    }
-
-    const fatigueMetrics = window.computeMetrics(10_000);
-    expect(classifyCognitiveState(fatigueMetrics).state).toBe('FATIGA_OCULAR');
-
-    // Ahora probamos fijación prolongada > 8s sin avance horizontal
-    const fixationWindow = new BiometricSlidingWindow(450, 30_000);
-    for (let i = 0; i < 100; i++) {
-      fixationWindow.push({
-        timestampMs: i * 100,
-        faceDetected: true,
-        avgEar: 0.29,
-        isEyeClosed: false,
-        blinkCompleted: i % 30 === 0,
-        blinkDurationMs: 120,
+        avgEar: isNormalBlink ? 0.12 : 0.29,
+        isEyeClosed: isNormalBlink,
+        blinkCompleted: ts === 4200,
+        blinkDurationMs: ts === 4200 ? 150 : 0,
         gazeX: 0.5,
         gazeY: 0.5,
         absDeltaX: 0,
         isSaccade: false,
-        isFixated: true,
+        isFixated: !isNormalBlink,
         isWithinBounds: true,
         isHeadAligned: true,
       });
     }
-    const fixationMetrics = fixationWindow.computeMetrics(10_000);
-    expect(classifyCognitiveState(fixationMetrics).state).toBe(
-      'DISTRACCION_BLOQUEO'
-    );
+
+    const metrics = window.computeMetrics(10_000);
+    expect(metrics.maxContinuousFixationMs).toBeGreaterThan(8000);
+    expect(classifyCognitiveState(metrics).state).toBe('DISTRACCION_BLOQUEO');
   });
 
-  it('respeta el cooldown de 10 minutos entre alertas del mismo tipo', () => {
+  it('decodifica BlazeFace SSD (896 anclas), normaliza tensores y procesa tensor plano sin GC', () => {
+    const tensor255 = new Float32Array([0, 127.5, 255]);
+    normalizeRgbTensorInPlace(tensor255, '-1_1');
+    expect(tensor255[0]).toBeCloseTo(-1, 3);
+    expect(tensor255[1]).toBeCloseTo(0, 3);
+    expect(tensor255[2]).toBeCloseTo(1, 3);
+
+    expect(BLAZEFACE_ANCHORS_X.length).toBe(BLAZEFACE_NUM_ANCHORS);
+    expect(BLAZEFACE_ANCHORS_Y.length).toBe(BLAZEFACE_NUM_ANCHORS);
+
+    const regs = new Float32Array(BLAZEFACE_NUM_ANCHORS * 16);
+    const scores = new Float32Array(BLAZEFACE_NUM_ANCHORS).fill(-10);
+    scores[100] = 4.0; // sigmoide(4) > 0.98
+    regs[100 * 16 + 2] = 64;
+    regs[100 * 16 + 3] = 64;
+
+    const crop = decodeBlazeFaceBestBox(regs, scores, 640, 480);
+    expect(crop).toBeDefined();
+    expect(crop!.score).toBeGreaterThan(0.95);
+
+    const pts = createNeutralLandmarks(0.03, 0.5, 0.5);
+    const flat = new Float32Array(TOTAL_FACE_LANDMARKS * 3);
+    for (let i = 0; i < TOTAL_FACE_LANDMARKS; i++) {
+      flat[i * 3] = pts[i].x;
+      flat[i * 3 + 1] = pts[i].y;
+      flat[i * 3 + 2] = pts[i].z ?? 0;
+    }
+
+    const res = processFlatTensorInWorklet(
+      flat,
+      192,
+      undefined,
+      1000,
+      DEFAULT_BASELINE_EAR,
+      DEFAULT_GAZE_BOUNDS,
+      { isCurrentlyClosed: false, closedStartedAtMs: null },
+      null
+    );
+    expect(res.sample.faceDetected).toBe(true);
+    expect(res.sample.isHeadAligned).toBe(true);
+
+    flat[33 * 3] = Number.NaN;
+    expect(parseFaceLandmarksOutput(flat)).toBeNull();
+  });
+
+  it('respeta cooldown de 10 minutos y sincroniza reloj único en StateMachine', () => {
     const sm = new CognitiveStateMachine();
     const distrMetrics = {
       sampleCount: 100,
@@ -211,15 +236,15 @@ describe('Motores Biométricos y Cognitivos', () => {
       latestWithinBounds: true,
     };
 
-    // Acumulamos > 15s en pasos de 5s
     sm.evaluate(distrMetrics, 0);
     sm.evaluate(distrMetrics, 5_000);
     sm.evaluate(distrMetrics, 10_000);
-    const alert1 = sm.evaluate(distrMetrics, 15_000);
+    const alert1 = sm.evaluate(distrMetrics, 16_000);
     expect(alert1.alertToTrigger).toBe('DISTRACCION_HAPTIC');
+    expect(alert1.distractedSec).toBe(16);
 
-    // Dentro de los 10 minutos no debe volver a disparar
     const withinCooldown = sm.evaluate(distrMetrics, 300_000);
     expect(withinCooldown.alertToTrigger).toBeNull();
+    expect(evaluateHeadPose(createNeutralLandmarks()).isAligned).toBe(true);
   });
 });

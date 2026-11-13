@@ -15,6 +15,9 @@ export interface StateEvaluationResult {
   reason: string;
   alertToTrigger: AlertType | null;
   shouldPauseEffectiveReading: boolean;
+  effectiveReadingSec: number;
+  distractedSec: number;
+  fatigueEventsCount: number;
   metrics: WindowMetrics;
 }
 
@@ -101,14 +104,17 @@ export function classifyCognitiveState(metrics: WindowMetrics): {
 }
 
 /**
- * Máquina de estados cognitivos con evaluación periódica, acumuladores
- * y cooldown de 10 minutos por tipo de alerta.
+ * Máquina de estados cognitivos y fuente única de verdad para los relojes
+ * de lectura efectiva, distracción acumulada, fatiga y cooldown de 10 minutos.
  */
 export class CognitiveStateMachine {
   private currentState: CognitiveState = 'LECTURA_ACTIVA';
   private accumulatedDistractionMs = 0;
+  private totalEffectiveReadingSec = 0;
+  private totalDistractedSec = 0;
   private continuousEffectiveReadingSec = 0;
-  private lastEvaluationAtMs: number | null = null;
+  private fatigueEventsCount = 0;
+  private lastClockTickAtMs: number | null = null;
   private lastAlertSentAt: Record<AlertType, number> = {
     DISTRACCION_HAPTIC: -Infinity,
     FATIGA_NOTIFICATION: -Infinity,
@@ -118,8 +124,11 @@ export class CognitiveStateMachine {
   reset(): void {
     this.currentState = 'LECTURA_ACTIVA';
     this.accumulatedDistractionMs = 0;
+    this.totalEffectiveReadingSec = 0;
+    this.totalDistractedSec = 0;
     this.continuousEffectiveReadingSec = 0;
-    this.lastEvaluationAtMs = null;
+    this.fatigueEventsCount = 0;
+    this.lastClockTickAtMs = null;
     this.lastAlertSentAt = {
       DISTRACCION_HAPTIC: -Infinity,
       FATIGA_NOTIFICATION: -Infinity,
@@ -139,6 +148,48 @@ export class CognitiveStateMachine {
     return this.continuousEffectiveReadingSec;
   }
 
+  getEffectiveReadingSec(): number {
+    return Math.round(this.totalEffectiveReadingSec);
+  }
+
+  getDistractedSec(): number {
+    return Math.round(this.totalDistractedSec);
+  }
+
+  getFatigueEventsCount(): number {
+    return this.fatigueEventsCount;
+  }
+
+  /**
+   * Avanza el reloj único de la sesión con base en el timestamp actual.
+   */
+  advanceClock(nowMs: number, isPaused: boolean): number {
+    if (this.lastClockTickAtMs === null) {
+      this.lastClockTickAtMs = nowMs;
+      return this.getEffectiveReadingSec();
+    }
+
+    const deltaMs = Math.max(0, nowMs - this.lastClockTickAtMs);
+    this.lastClockTickAtMs = nowMs;
+
+    if (!isPaused) {
+      const deltaSec = deltaMs / 1000;
+      if (this.currentState === 'LECTURA_ACTIVA') {
+        this.totalEffectiveReadingSec += deltaSec;
+        this.continuousEffectiveReadingSec += deltaSec;
+        this.accumulatedDistractionMs = Math.max(
+          0,
+          this.accumulatedDistractionMs - deltaMs * 0.5
+        );
+      } else if (this.currentState === 'DISTRACCION_BLOQUEO') {
+        this.totalDistractedSec += deltaSec;
+        this.accumulatedDistractionMs += deltaMs;
+      }
+    }
+
+    return this.getEffectiveReadingSec();
+  }
+
   private canFireAlert(type: AlertType, nowMs: number): boolean {
     return nowMs - this.lastAlertSentAt[type] >= ALERT_COOLDOWN_MS;
   }
@@ -152,11 +203,7 @@ export class CognitiveStateMachine {
     nowMs: number,
     isPaused: boolean = false
   ): StateEvaluationResult {
-    const elapsedMs =
-      this.lastEvaluationAtMs !== null
-        ? Math.max(0, nowMs - this.lastEvaluationAtMs)
-        : STATE_EVALUATION_INTERVAL_MS;
-    this.lastEvaluationAtMs = nowMs;
+    this.advanceClock(nowMs, isPaused);
 
     if (isPaused) {
       return {
@@ -164,22 +211,15 @@ export class CognitiveStateMachine {
         reason: 'Sesión en pausa',
         alertToTrigger: null,
         shouldPauseEffectiveReading: true,
+        effectiveReadingSec: this.getEffectiveReadingSec(),
+        distractedSec: this.getDistractedSec(),
+        fatigueEventsCount: this.fatigueEventsCount,
         metrics,
       };
     }
 
     const { state, reason } = classifyCognitiveState(metrics);
     this.currentState = state;
-
-    if (state === 'LECTURA_ACTIVA') {
-      this.continuousEffectiveReadingSec += elapsedMs / 1000;
-      this.accumulatedDistractionMs = Math.max(
-        0,
-        this.accumulatedDistractionMs - elapsedMs * 0.5
-      );
-    } else if (state === 'DISTRACCION_BLOQUEO') {
-      this.accumulatedDistractionMs += elapsedMs;
-    }
 
     let alertToTrigger: AlertType | null = null;
     let shouldPauseEffectiveReading = false;
@@ -190,6 +230,7 @@ export class CognitiveStateMachine {
     ) {
       alertToTrigger = 'FATIGA_NOTIFICATION';
       shouldPauseEffectiveReading = true;
+      this.fatigueEventsCount += 1;
       this.markAlertFired('FATIGA_NOTIFICATION', nowMs);
     } else if (
       this.continuousEffectiveReadingSec >= CONTINUOUS_READING_BREAK_SEC &&
@@ -213,6 +254,9 @@ export class CognitiveStateMachine {
       reason,
       alertToTrigger,
       shouldPauseEffectiveReading,
+      effectiveReadingSec: this.getEffectiveReadingSec(),
+      distractedSec: this.getDistractedSec(),
+      fatigueEventsCount: this.fatigueEventsCount,
       metrics,
     };
   }

@@ -128,9 +128,32 @@ export async function listReadingSessions(
 ): Promise<ReadingSessionRow[]> {
   const db = await getDatabase();
   return db.getAllAsync<ReadingSessionRow>(
-    `SELECT * FROM reading_sessions ORDER BY start_time DESC LIMIT ?`,
+    `SELECT * FROM reading_sessions
+     WHERE end_time IS NOT NULL OR effective_reading_sec > 0
+     ORDER BY start_time DESC
+     LIMIT ?`,
     [limit]
   );
+}
+
+/**
+ * Cierra sesiones huérfanas que quedaron abiertas tras un cierre abrupto de la app,
+ * eliminando registros vacíos sin tiempo efectivo ni snapshots.
+ */
+export async function reconcileOrphanedSessions(): Promise<void> {
+  await withDbTransaction(async (db) => {
+    await db.runAsync(
+      `DELETE FROM reading_sessions
+       WHERE end_time IS NULL
+         AND effective_reading_sec = 0
+         AND id NOT IN (SELECT DISTINCT session_id FROM telemetry_snapshots)`
+    );
+    await db.runAsync(
+      `UPDATE reading_sessions
+       SET end_time = start_time + (effective_reading_sec + distracted_sec) * 1000
+       WHERE end_time IS NULL`
+    );
+  });
 }
 
 export async function getReadingSessionById(
@@ -176,7 +199,8 @@ export async function getGlobalStats(): Promise<GlobalTelemetryStats> {
        SUM(distracted_sec) AS total_distracted,
        SUM(fatigue_events_count) AS total_fatigue,
        AVG(CASE WHEN avg_blink_rate > 0 THEN avg_blink_rate ELSE NULL END) AS avg_blink
-     FROM reading_sessions`
+     FROM reading_sessions
+     WHERE end_time IS NOT NULL OR effective_reading_sec > 0`
   );
 
   const onset = await db.getFirstAsync<{ avg_onset_sec: number | null }>(

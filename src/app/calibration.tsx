@@ -44,6 +44,7 @@ export default function CalibrationScreen() {
     {
       baselineEar: DEFAULT_BASELINE_EAR,
       gazeBounds: DEFAULT_GAZE_BOUNDS,
+      faceDetectorModel: vision.faceDetectorModel,
       isActive: isRunning && vision.modelReady,
     },
     handleSample
