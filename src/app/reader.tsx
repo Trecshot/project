@@ -29,6 +29,7 @@ import {
   CognitiveStateMachine,
   STATE_EVALUATION_INTERVAL_MS,
 } from '../core/cognitive/stateMachine';
+import { logTelemetryError, monotonicNowMs } from '../core/utils/clock';
 import { useBiometricFrameProcessor } from '../core/vision/frameProcessor';
 import {
   Camera,
@@ -41,6 +42,7 @@ import {
   insertTelemetrySnapshot,
 } from '../database/telemetryRepository';
 import { dispatchCognitiveAlert } from '../services/alertService';
+import { purgeDocumentCache } from '../services/cacheService';
 
 const SAMPLE_STUDY_TEXT = `Neurobiología de la Atención y Fatiga Visual
 
@@ -87,7 +89,8 @@ export default function ReaderScreen() {
   const [amberHighlight, setAmberHighlight] = useState(false);
 
   const sessionIdRef = useRef<number | null>(null);
-  const sessionStartRef = useRef<number>(Date.now());
+  const sessionWallStartRef = useRef<number>(Date.now());
+  const sessionMonotonicStartRef = useRef<number>(monotonicNowMs());
   const hasFinalizedRef = useRef(false);
   const blinkRateSamplesRef = useRef<number[]>([]);
   const isPausedRef = useRef(false);
@@ -109,8 +112,7 @@ export default function ReaderScreen() {
         hasFinalizedRef.current = true;
       }
 
-      const nowMs = Date.now();
-      stateMachine.advanceClock(nowMs, isPausedRef.current);
+      stateMachine.advanceClock(monotonicNowMs(), isPausedRef.current);
 
       const samples = blinkRateSamplesRef.current;
       const meanBlink =
@@ -120,7 +122,7 @@ export default function ReaderScreen() {
 
       await finishReadingSession({
         sessionId: sid,
-        endTime: nowMs,
+        endTime: Date.now(),
         effectiveReadingSec: stateMachine.getEffectiveReadingSec(),
         distractedSec: stateMachine.getDistractedSec(),
         fatigueEventsCount: stateMachine.getFatigueEventsCount(),
@@ -133,7 +135,13 @@ export default function ReaderScreen() {
   // Solicita permiso de cámara frontal si aún no se otorgó
   useEffect(() => {
     if (!vision.hasPermission) {
-      vision.requestPermission().catch(() => {});
+      vision.requestPermission().catch((err) => {
+        logTelemetryError(
+          'ReaderScreen',
+          'Error solicitando permiso de cámara',
+          err
+        );
+      });
     }
   }, [vision.hasPermission, vision.requestPermission]);
 
@@ -141,49 +149,64 @@ export default function ReaderScreen() {
   useEffect(() => {
     let active = true;
     (async () => {
-      const cal = await getLatestCalibration();
-      if (active && cal) {
-        setBaselineEar(cal.baseline_ear);
-        setGazeBounds({
-          minGazeX: cal.min_gaze_x,
-          maxGazeX: cal.max_gaze_x,
-          minGazeY: cal.min_gaze_y,
-          maxGazeY: cal.max_gaze_y,
-        });
-      }
-
-      if (docUri) {
-        try {
-          if (mode === 'text') {
-            const content = await FileSystem.readAsStringAsync(docUri);
-            if (active && content) setTextContent(content);
-          } else if (mode === 'pdf' || mode === 'epub') {
-            const info = await FileSystem.getInfoAsync(docUri);
-            if (
-              info.exists &&
-              typeof info.size === 'number' &&
-              info.size > MAX_DOCUMENT_BYTES
-            ) {
-              if (active) {
-                setFileTooLargeError(
-                  `El archivo supera el límite seguro de 15 MB (${(info.size / (1024 * 1024)).toFixed(1)} MB).`
-                );
-              }
-            } else {
-              const b64 = await FileSystem.readAsStringAsync(docUri, {
-                encoding: FileSystem.EncodingType.Base64,
-              });
-              if (active && b64) setBase64Content(b64);
-            }
-          }
-        } catch {
-          // Mantiene contenido de respaldo si falla la lectura local
+      try {
+        const cal = await getLatestCalibration();
+        if (active && cal) {
+          setBaselineEar(cal.baseline_ear);
+          setGazeBounds({
+            minGazeX: cal.min_gaze_x,
+            maxGazeX: cal.max_gaze_x,
+            minGazeY: cal.min_gaze_y,
+            maxGazeY: cal.max_gaze_y,
+          });
         }
-      }
 
-      const id = await createReadingSession(docTitle, sessionStartRef.current);
-      if (active) {
-        sessionIdRef.current = id;
+        if (docUri) {
+          try {
+            if (mode === 'text') {
+              const content = await FileSystem.readAsStringAsync(docUri);
+              if (active && content) setTextContent(content);
+            } else if (mode === 'pdf' || mode === 'epub') {
+              const info = await FileSystem.getInfoAsync(docUri);
+              if (
+                info.exists &&
+                typeof info.size === 'number' &&
+                info.size > MAX_DOCUMENT_BYTES
+              ) {
+                if (active) {
+                  setFileTooLargeError(
+                    `El archivo supera el límite seguro de 15 MB (${(info.size / (1024 * 1024)).toFixed(1)} MB).`
+                  );
+                }
+              } else {
+                const b64 = await FileSystem.readAsStringAsync(docUri, {
+                  encoding: FileSystem.EncodingType.Base64,
+                });
+                if (active && b64) setBase64Content(b64);
+              }
+            }
+          } catch (docErr) {
+            logTelemetryError(
+              'ReaderScreen',
+              `Error leyendo documento local (${mode})`,
+              docErr
+            );
+          }
+        }
+
+        const id = await createReadingSession(
+          docTitle,
+          sessionWallStartRef.current
+        );
+        if (active) {
+          sessionIdRef.current = id;
+        }
+      } catch (initErr) {
+        logTelemetryError(
+          'ReaderScreen',
+          'Error inicializando sesión de lectura en SQLite',
+          initErr
+        );
       }
     })();
 
@@ -192,19 +215,38 @@ export default function ReaderScreen() {
     };
   }, [docTitle, docUri, mode]);
 
-  // Cierre idempotente y seguro de la sesión únicamente al desmontar ReaderScreen
+  // Cierre idempotente y purga del caché documental al desmontar ReaderScreen
   useEffect(() => {
     return () => {
-      persistSessionSummary(true).catch(() => {});
+      persistSessionSummary(true).catch((err) => {
+        logTelemetryError(
+          'ReaderScreen',
+          'Error cerrando sesión al desmontar pantalla',
+          err
+        );
+      });
+      purgeDocumentCache(docUri).catch((err) => {
+        logTelemetryError(
+          'ReaderScreen',
+          'Error limpiando caché al desmontar ReaderScreen',
+          err
+        );
+      });
     };
-  }, [persistSessionSummary]);
+  }, [persistSessionSummary, docUri]);
 
   // Guarda progreso cuando la app pasa a segundo plano o se apaga la pantalla
   useEffect(() => {
     const sub = AppState.addEventListener('change', (nextState) => {
       if (nextState === 'background' || nextState === 'inactive') {
         setIsPaused(true);
-        persistSessionSummary(false).catch(() => {});
+        persistSessionSummary(false).catch((err) => {
+          logTelemetryError(
+            'ReaderScreen',
+            'Error guardando progreso al pasar a segundo plano',
+            err
+          );
+        });
       }
     });
     return () => sub.remove();
@@ -229,10 +271,13 @@ export default function ReaderScreen() {
     onBiometricSample
   );
 
-  // Reloj único de UI sincronizado con CognitiveStateMachine (1s)
+  // Reloj único de UI sincronizado con CognitiveStateMachine (1s, reloj monotónico)
   useEffect(() => {
     const tick = setInterval(() => {
-      const sec = stateMachine.advanceClock(Date.now(), isPausedRef.current);
+      const sec = stateMachine.advanceClock(
+        monotonicNowMs(),
+        isPausedRef.current
+      );
       setEffectiveReadingSec(sec);
     }, 1000);
     return () => clearInterval(tick);
@@ -241,11 +286,11 @@ export default function ReaderScreen() {
   // Loop unificado: evalúa cada 5s y persiste snapshot cada 3 ticks (15s) sin recalcular dos veces
   useEffect(() => {
     const evalTimer = setInterval(() => {
-      const nowMs = Date.now();
-      const metrics = slidingWindow.computeMetrics(nowMs);
+      const nowMonoMs = monotonicNowMs();
+      const metrics = slidingWindow.computeMetrics(nowMonoMs);
       const result = stateMachine.evaluate(
         metrics,
-        nowMs,
+        nowMonoMs,
         isPausedRef.current
       );
 
@@ -271,7 +316,13 @@ export default function ReaderScreen() {
           setIsPaused(true);
           setShowBreakModal(true);
         }
-        dispatchCognitiveAlert(result.alertToTrigger).catch(() => {});
+        dispatchCognitiveAlert(result.alertToTrigger).catch((err) => {
+          logTelemetryError(
+            'ReaderScreen',
+            `Error despachando alerta ${result.alertToTrigger}`,
+            err
+          );
+        });
       }
 
       evalTickCountRef.current += 1;
@@ -281,7 +332,9 @@ export default function ReaderScreen() {
         !isPausedRef.current &&
         evalTickCountRef.current % 3 === 0
       ) {
-        const offsetSec = Math.round((nowMs - sessionStartRef.current) / 1000);
+        const offsetSec = Math.round(
+          (nowMonoMs - sessionMonotonicStartRef.current) / 1000
+        );
         insertTelemetrySnapshot({
           sessionId: sid,
           timestampOffsetSec: offsetSec,
@@ -289,7 +342,13 @@ export default function ReaderScreen() {
           avgEar:
             metrics.validFaceSampleCount > 0 ? metrics.avgEar : baselineEar,
           saccadeFrequency: metrics.saccadeFrequencyHz,
-        }).catch(() => {});
+        }).catch((err) => {
+          logTelemetryError(
+            'ReaderScreen',
+            'Error insertando telemetry_snapshot en SQLite',
+            err
+          );
+        });
       }
     }, STATE_EVALUATION_INTERVAL_MS);
 

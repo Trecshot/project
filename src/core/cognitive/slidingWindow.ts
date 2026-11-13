@@ -38,6 +38,7 @@ export const DEFAULT_BUFFER_CAPACITY = 600; // Hasta 30s @ 20 FPS (450 @ 15 FPS)
 
 /**
  * Buffer circular en memoria para almacenar muestras biométricas de los últimos 30-60s.
+ * Usa recorrido inverso con corte temprano (sin `.filter` ni arreglos intermedios).
  */
 export class BiometricSlidingWindow {
   private readonly capacity: number;
@@ -69,35 +70,59 @@ export class BiometricSlidingWindow {
     this.size = 0;
   }
 
-  /**
-   * Devuelve las muestras ordenadas cronológicamente dentro de la ventana activa.
-   */
-  getSamples(referenceNowMs?: number): BiometricFrameSample[] {
-    if (this.size === 0) return [];
-
-    const ordered: BiometricFrameSample[] = [];
-    const startIdx = this.size === this.capacity ? this.head : 0;
-
-    for (let i = 0; i < this.size; i++) {
-      const item = this.buffer[(startIdx + i) % this.capacity];
-      if (item) ordered.push(item);
-    }
-
-    if (ordered.length === 0) return [];
-
-    const cutoffAnchor =
-      referenceNowMs ?? ordered[ordered.length - 1].timestampMs;
-    const minTimestamp = cutoffAnchor - this.windowDurationMs;
-
-    return ordered.filter((s) => s.timestampMs >= minTimestamp);
+  private getSampleBackwards(backOffset: number): BiometricFrameSample | undefined {
+    const idx =
+      (this.head - 1 - backOffset + this.capacity * 2) % this.capacity;
+    return this.buffer[idx];
   }
 
   /**
-   * Calcula las métricas agregadas de la ventana deslizante para la máquina de estados.
+   * Cuenta en O(K) cuántas muestras recientes caen dentro de la ventana activa
+   * recorriendo en reverso hasta cruzar `minTimestamp`.
+   */
+  private countActiveWindowSamples(referenceNowMs?: number): number {
+    if (this.size === 0) return 0;
+
+    const newest = this.getSampleBackwards(0);
+    if (!newest) return 0;
+
+    const cutoffAnchor = referenceNowMs ?? newest.timestampMs;
+    const minTimestamp = cutoffAnchor - this.windowDurationMs;
+
+    let validCount = 0;
+    for (let offset = 0; offset < this.size; offset++) {
+      const item = this.getSampleBackwards(offset);
+      if (!item || item.timestampMs < minTimestamp) {
+        break;
+      }
+      validCount++;
+    }
+
+    return validCount;
+  }
+
+  /**
+   * Devuelve las muestras ordenadas cronológicamente dentro de la ventana activa
+   * en una sola pasada acotada (sin `.filter()`).
+   */
+  getSamples(referenceNowMs?: number): BiometricFrameSample[] {
+    const validCount = this.countActiveWindowSamples(referenceNowMs);
+    if (validCount === 0) return [];
+
+    const result = new Array<BiometricFrameSample>(validCount);
+    for (let i = 0; i < validCount; i++) {
+      result[i] = this.getSampleBackwards(validCount - 1 - i)!;
+    }
+    return result;
+  }
+
+  /**
+   * Calcula las métricas agregadas directamente sobre el buffer circular
+   * sin instanciar arreglos intermedios (cero presión de GC).
    */
   computeMetrics(referenceNowMs?: number): WindowMetrics {
-    const samples = this.getSamples(referenceNowMs);
-    if (samples.length === 0) {
+    const validCount = this.countActiveWindowSamples(referenceNowMs);
+    if (validCount === 0) {
       return {
         sampleCount: 0,
         validFaceSampleCount: 0,
@@ -116,9 +141,9 @@ export class BiometricSlidingWindow {
       };
     }
 
-    const firstTs = samples[0].timestampMs;
-    const lastTs = samples[samples.length - 1].timestampMs;
-    const windowSpanMs = Math.max(0, lastTs - firstTs);
+    const first = this.getSampleBackwards(validCount - 1)!;
+    const latest = this.getSampleBackwards(0)!;
+    const windowSpanMs = Math.max(0, latest.timestampMs - first.timestampMs);
 
     let validFaceSampleCount = 0;
     let earSum = 0;
@@ -134,7 +159,9 @@ export class BiometricSlidingWindow {
     let outOfBoundsStartMs: number | null = null;
     let maxContinuousOutOfBoundsMs = 0;
 
-    for (const s of samples) {
+    for (let offset = validCount - 1; offset >= 0; offset--) {
+      const s = this.getSampleBackwards(offset)!;
+
       if (!s.faceDetected) {
         fixationStartMs = null;
         closedInFixationStartMs = null;
@@ -173,7 +200,6 @@ export class BiometricSlidingWindow {
             s.timestampMs - closedInFixationStartMs >
             LONG_BLINK_THRESHOLD_MS
           ) {
-            // Cierre prolongado (> 400 ms): ya no es fijación, cuenta como fatiga
             fixationStartMs = null;
           } else if (fixationStartMs !== null) {
             maxContinuousFixationMs = Math.max(
@@ -216,10 +242,9 @@ export class BiometricSlidingWindow {
       validFaceSampleCount > 0 ? closedCount / validFaceSampleCount : 0;
     const blinkRatePerMin = (blinkCount / spanSec) * 60;
     const saccadeFrequencyHz = saccadeCount / spanSec;
-    const latest = samples[samples.length - 1];
 
     return {
-      sampleCount: samples.length,
+      sampleCount: validCount,
       validFaceSampleCount,
       windowSpanMs,
       avgEar,

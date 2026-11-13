@@ -2,6 +2,7 @@ import { Platform } from 'react-native';
 import * as Haptics from 'expo-haptics';
 import * as Notifications from 'expo-notifications';
 import { AlertType } from '../core/cognitive/stateMachine';
+import { logTelemetryError } from '../core/utils/clock';
 
 const BREAK_CHANNEL_ID = 'eye-telemetry-breaks';
 
@@ -48,8 +49,12 @@ export async function triggerDistractionHaptic(): Promise<void> {
     await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
     await new Promise((resolve) => setTimeout(resolve, 140));
     await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-  } catch {
-    // Dispositivos sin motor háptico o simuladores ignoran silenciosamente
+  } catch (err) {
+    logTelemetryError(
+      'AlertService',
+      'Fallo ejecutando micro-vibración háptica',
+      err
+    );
   }
 }
 
@@ -68,8 +73,8 @@ export async function triggerBreakNotification(
 
   try {
     await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Warning);
-  } catch {
-    // No-op si no hay háptico
+  } catch (err) {
+    logTelemetryError('AlertService', 'Fallo en háptico de advertencia', err);
   }
 
   try {
@@ -83,8 +88,12 @@ export async function triggerBreakNotification(
       },
       trigger: null,
     });
-  } catch {
-    // En caso de permisos denegados, el HUD en pantalla igualmente muestra la pausa
+  } catch (err) {
+    logTelemetryError(
+      'AlertService',
+      'Error programando notificación local de descanso',
+      err
+    );
   }
 }
 

@@ -3,8 +3,10 @@ import { ActivityIndicator, StyleSheet, Text, View } from 'react-native';
 import { Stack } from 'expo-router';
 import { StatusBar } from 'expo-status-bar';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
+import { logTelemetryError } from '../core/utils/clock';
 import { getDatabase } from '../database/dbClient';
 import { initializeAlerts } from '../services/alertService';
+import { purgeDocumentCache } from '../services/cacheService';
 
 interface DatabaseContextValue {
   isReady: boolean;
@@ -30,10 +32,16 @@ export default function RootLayout() {
       try {
         await getDatabase();
         await initializeAlerts();
+        await purgeDocumentCache();
         if (mounted) {
           setIsReady(true);
         }
       } catch (err) {
+        logTelemetryError(
+          'RootLayout',
+          'Fallo crítico durante inicialización global',
+          err
+        );
         if (mounted) {
           setError(
             err instanceof Error

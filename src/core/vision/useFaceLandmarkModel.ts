@@ -14,6 +14,7 @@ import {
   useCameraFormat,
   useCameraPermission,
 } from 'react-native-vision-camera';
+import { logTelemetryError } from '../utils/clock';
 import { BUNDLED_MODEL_MODULES } from './modelAssets';
 
 export const LANDMARK_MODEL_FILENAME = 'face_landmarks_detector.tflite';
@@ -47,8 +48,12 @@ async function resolveModelUri(
     if (localInfo.exists) {
       return localPath;
     }
-  } catch {
-    // Continuar con asset empaquetado si existe
+  } catch (err) {
+    logTelemetryError(
+      'VisionModelSetup',
+      `Error verificando modelo local ${localFilename}`,
+      err
+    );
   }
 
   if (bundledModule !== null) {
@@ -128,12 +133,18 @@ export function useVisionTelemetrySetup(): VisionPipelineStatus {
         setFaceDetectorModel(detRes.model);
       }
     } catch (err) {
-      console.warn('[EyeTelemetry] Error cargando modelos TFLite:', err);
+      logTelemetryError('VisionModelSetup', 'Error cargando modelos TFLite', err);
     }
   }, []);
 
   useEffect(() => {
-    loadModels().catch(() => {});
+    loadModels().catch((err) => {
+      logTelemetryError(
+        'VisionModelSetup',
+        'Fallo inesperado inicializando modelos TFLite',
+        err
+      );
+    });
   }, [loadModels]);
 
   const importLocalModel = useCallback(

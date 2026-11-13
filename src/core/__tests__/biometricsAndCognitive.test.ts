@@ -19,6 +19,7 @@ import {
   CognitiveStateMachine,
   classifyCognitiveState,
 } from '../cognitive/stateMachine';
+import { monotonicNowMs } from '../utils/clock';
 import {
   BLAZEFACE_ANCHORS_X,
   BLAZEFACE_ANCHORS_Y,
@@ -264,5 +265,35 @@ describe('Motores Biométricos, Visión SSD y Cognición', () => {
     expect(cal.bounds.maxGazeX).toBeLessThan(0.85);
     expect(cal.bounds.minGazeY).toBeGreaterThan(0.1);
     expect(cal.bounds.maxGazeY).toBeLessThan(0.85);
+  });
+
+  it('corta la ventana deslizante en reverso y provee reloj monotónico', () => {
+    const win = new BiometricSlidingWindow(10, 5_000);
+    for (let t = 1_000; t <= 10_000; t += 1_000) {
+      win.push({
+        timestampMs: t,
+        faceDetected: true,
+        avgEar: 0.28,
+        isEyeClosed: false,
+        blinkCompleted: false,
+        blinkDurationMs: 0,
+        gazeX: 0.5,
+        gazeY: 0.5,
+        absDeltaX: 0.02,
+        isSaccade: true,
+        isFixated: false,
+        isWithinBounds: true,
+        isHeadAligned: true,
+      });
+    }
+
+    const active = win.getSamples(10_000);
+    expect(active.length).toBe(6); // t = 5000..10000
+    expect(active[0].timestampMs).toBe(5_000);
+    expect(active[active.length - 1].timestampMs).toBe(10_000);
+
+    const t1 = monotonicNowMs();
+    const t2 = monotonicNowMs();
+    expect(t2).toBeGreaterThanOrEqual(t1);
   });
 });

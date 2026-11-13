@@ -16,6 +16,7 @@ import {
   IrisCentroid,
 } from '../biometrics/saccadeEngine';
 import { BiometricFrameSample } from '../cognitive/slidingWindow';
+import { monotonicNowMs } from '../utils/clock';
 import {
   BLAZEFACE_INPUT_SIZE,
   decodeBlazeFaceBestBox,
@@ -277,7 +278,7 @@ export function useBiometricFrameProcessor(
         return;
       }
 
-      const nowMs = Date.now();
+      const nowMs = monotonicNowMs();
       if (nowMs - lastProcessedTsShared.value < minIntervalMs) {
         return;
       }

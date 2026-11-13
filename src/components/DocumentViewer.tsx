@@ -1,4 +1,4 @@
-import React, { useCallback, useMemo, useRef } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef } from 'react';
 import { ScrollView, StyleSheet, Text, View } from 'react-native';
 import { WebView } from 'react-native-webview';
 
@@ -144,6 +144,16 @@ export function DocumentViewer({
 }: DocumentViewerProps) {
   const webViewRef = useRef<WebView>(null);
   const injectedOnceRef = useRef(false);
+  const rafIdRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (rafIdRef.current !== null) {
+        cancelAnimationFrame(rafIdRef.current);
+        rafIdRef.current = null;
+      }
+    };
+  }, []);
 
   const shellHtml = useMemo(() => {
     injectedOnceRef.current = false;
@@ -158,13 +168,26 @@ export function DocumentViewer({
     }
     injectedOnceRef.current = true;
 
-    for (let i = 0; i < base64Content.length; i += BASE64_CHUNK_SIZE) {
-      const slice = base64Content.slice(i, i + BASE64_CHUNK_SIZE);
+    const injectChunk = (index: number) => {
+      if (!webViewRef.current) return;
+      if (index >= base64Content.length) {
+        webViewRef.current.injectJavaScript(`window.__renderDocument();true;`);
+        rafIdRef.current = null;
+        return;
+      }
+
+      const slice = base64Content.slice(index, index + BASE64_CHUNK_SIZE);
       webViewRef.current.injectJavaScript(
         `window.__appendDocChunk(${JSON.stringify(slice)});true;`
       );
-    }
-    webViewRef.current.injectJavaScript(`window.__renderDocument();true;`);
+
+      // Libera el hilo JS entre iteraciones para mantener la UI fluida
+      rafIdRef.current = requestAnimationFrame(() =>
+        injectChunk(index + BASE64_CHUNK_SIZE)
+      );
+    };
+
+    injectChunk(0);
   }, [base64Content]);
 
   if (fileTooLargeError) {

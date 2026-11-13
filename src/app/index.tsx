@@ -12,6 +12,7 @@ import * as DocumentPicker from 'expo-document-picker';
 import { router, useFocusEffect } from 'expo-router';
 import { formatDuration } from '../components/CognitiveHUD';
 import { MAX_DOCUMENT_BYTES } from '../components/DocumentViewer';
+import { logTelemetryError } from '../core/utils/clock';
 import { useVisionTelemetrySetup } from '../core/vision/useFaceLandmarkModel';
 import {
   GlobalTelemetryStats,
@@ -47,7 +48,7 @@ export default function DashboardScreen() {
   useFocusEffect(
     useCallback(() => {
       loadDashboard().catch((err) =>
-        console.warn('Error cargando dashboard:', err)
+        logTelemetryError('DashboardScreen', 'Error cargando dashboard', err)
       );
     }, [loadDashboard])
   );
@@ -123,7 +124,12 @@ export default function DashboardScreen() {
           title: asset.name ?? 'Documento local',
         },
       });
-    } catch {
+    } catch (err) {
+      logTelemetryError(
+        'DashboardScreen',
+        'Error abriendo selector de documentos',
+        err
+      );
       Alert.alert('Error', 'No se pudo abrir el selector de documentos.');
     }
   };
