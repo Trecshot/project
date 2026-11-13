@@ -1,0 +1,60 @@
+{
+  "expo": {
+    "name": "Eye Telemetry",
+    "slug": "eye-telemetry-app",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "scheme": "eye-telemetry",
+    "userInterfaceStyle": "dark",
+    "newArchEnabled": true,
+    "assetBundlePatterns": [
+      "**/*",
+      "assets/models/*",
+      "assets/sounds/*"
+    ],
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.eyetelemetry.app",
+      "infoPlist": {
+        "NSCameraUsageDescription": "Necesitamos acceso a la cámara frontal para medir parpadeos, sacadas de lectura y fatiga ocular de forma local en tu dispositivo."
+      }
+    },
+    "android": {
+      "package": "com.eyetelemetry.app",
+      "permissions": [
+        "android.permission.CAMERA",
+        "android.permission.VIBRATE",
+        "android.permission.POST_NOTIFICATIONS"
+      ]
+    },
+    "plugins": [
+      "expo-router",
+      "expo-sqlite",
+      [
+        "react-native-vision-camera",
+        {
+          "cameraPermissionText": "Eye Telemetry usa la cámara frontal localmente para detectar fatiga ocular y pérdida de foco mientras lees, sin guardar ni enviar video.",
+          "enableFrameProcessors": true
+        }
+      ],
+      [
+        "react-native-fast-tflite",
+        {
+          "enableGpuDelegate": true,
+          "enableCoreMLDelegate": true
+        }
+      ],
+      [
+        "expo-notifications",
+        {
+          "sounds": [
+            "./assets/sounds/soft_chime.wav"
+          ]
+        }
+      ]
+    ],
+    "experiments": {
+      "typedRoutes": true
+    }
+  }
+}
