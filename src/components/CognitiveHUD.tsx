@@ -1,5 +1,6 @@
 import React from 'react';
 import { Pressable, StyleSheet, Text, View } from 'react-native';
+import Svg, { Polygon, Rect } from 'react-native-svg';
 import { CognitiveState } from '../core/cognitive/stateMachine';
 
 interface CognitiveHUDProps {
@@ -99,7 +100,16 @@ export function CognitiveHUD({
           style={styles.pauseBtn}
           accessibilityLabel={isPaused ? 'Reanudar lectura' : 'Pausar lectura'}
         >
-          <Text style={styles.pauseBtnText}>{isPaused ? '▶' : '⏸'}</Text>
+          {isPaused ? (
+            <Svg width={12} height={12} viewBox="0 0 12 12">
+              <Polygon points="2.5,1.5 10.5,6 2.5,10.5" fill="#F8FAFC" />
+            </Svg>
+          ) : (
+            <Svg width={12} height={12} viewBox="0 0 12 12">
+              <Rect x={2} y={1.8} width={2.8} height={8.4} rx={0.8} fill="#F8FAFC" />
+              <Rect x={7.2} y={1.8} width={2.8} height={8.4} rx={0.8} fill="#F8FAFC" />
+            </Svg>
+          )}
         </Pressable>
       </View>
     </View>
@@ -164,10 +174,5 @@ const styles = StyleSheet.create({
     backgroundColor: 'rgba(255, 255, 255, 0.14)',
     alignItems: 'center',
     justifyContent: 'center',
-  },
-  pauseBtnText: {
-    color: '#F8FAFC',
-    fontSize: 12,
-    fontWeight: '700',
   },
 });
